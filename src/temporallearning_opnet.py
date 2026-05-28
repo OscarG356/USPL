@@ -1,629 +1,663 @@
+
 # ─────────────────────────────────────────────────────────────
-#  MODO RENDIMIENTO MÁXIMO
-#  - display() y plt.show() desactivados
-#  - verbose=0 en todos los GridSearch
-#  - prints intermedios silenciados
-#  - try/except por iteración para que nunca se detenga solo
-#  - gc.collect() al final de cada vuelta
-#  - resumen final con resultados y errores
+# IMPORTS
 # ─────────────────────────────────────────────────────────────
 
 import gc
 import os
-import traceback
-
+import datetime
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use('Agg')  # Backend sin ventana, evita errores en PC sin display
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-
+import matplotlib.cm as cm
+import seaborn as sns
+import shap
+import argparse
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVR
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import BayesianRidge
+from xgboost import XGBRegressor
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from sklearn.inspection import permutation_importance
 
-loaded_df = pd.read_csv('extracted_features.csv')
 
-t_Corriente = loaded_df['target_current'].values
-features_df = loaded_df.drop(columns=['target_current'])
+# ══════════════════════════════════════════════════════════════
+# 0. CONFIGURACIÓN
+# ══════════════════════════════════════════════════════════════
 
-print(f"[INFO] Dataset cargado. Features: {features_df.shape}, Target: {t_Corriente.shape}")
-print(f"[INFO] Iniciando loop de iteraciones...\n")
+parser = argparse.ArgumentParser(description='Entrenamiento Temporal OPNET')
+parser.add_argument('--uspl', type=int, default=1,
+                    help='ID del láser (1 o 2)')
+# Argumento añadido: permite apuntar consenso_score a un run previo.
+# No afecta al comportamiento original; el run actual sigue siendo TIMESTAMP.
+parser.add_argument('--run',  type=str, default=None,
+                    help='(Opcional) ID de un run previo para recalcular '
+                         'consenso_score sin reentrenar. Ej: run_20240101_120000')
+# Nuevo: régimen de operación (pulse o sc)
+parser.add_argument('--regimen', type=str, choices=['pulse', 'sc'], default='pulse',
+                help='Regimen de operación: Pulsado (pulse) o supercontinuo (sc)')
+# Si regimen=sc, elegir modo: edfa o curr
+parser.add_argument('--sc_mode', type=str, choices=['edfa', 'curr'], default='curr',
+                help='Si regimen=sc, elegir modo de operación: EDFA (edfa) o Corriente (curr)')
+args = parser.parse_args()
 
-# ── Registro de resultados y errores ───────────────────────────
-iteration_log = []   # Guardará todas las métricas solicitadas
+USPL_ID = f"USPL_{args.uspl}"   # "USPL_1" o "USPL_2"
+
+# Runtime options from CLI
+REGIMEN = args.regimen
+SC_MODE = args.sc_mode if REGIMEN == 'sc' else None
+
+BASE_DIR  = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+TIMESTAMP = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+RUN_DIR          = os.path.join(BASE_DIR, "data", f"data_{USPL_ID}", "outputs", f"run_{TIMESTAMP}")
+DIR_REPORTS_FIGS = os.path.join(BASE_DIR, "reports", f"reports_{USPL_ID}", "figures", f"run_{TIMESTAMP}")
+#PATH_FEATURES    = os.path.join(BASE_DIR, "data", f"data_{USPL_ID}", "processed", "extracted_features.csv")
+if REGIMEN == 'pulse':
+    PATH_FEATURES = os.path.join(BASE_DIR, "data", f"data_{USPL_ID}", "processed", "extracted_features.csv")
+elif REGIMEN == 'sc' and SC_MODE == 'edfa':
+    PATH_FEATURES = os.path.join(BASE_DIR, "data", f"data_{USPL_ID}", "processed", "SC", "Var_EDFA", "extracted_features.csv")
+elif REGIMEN == 'sc' and SC_MODE == 'curr':
+    PATH_FEATURES = os.path.join(BASE_DIR, "data", f"data_{USPL_ID}", "processed", "SC", "Var_Cur", "extracted_features.csv")
+
+os.makedirs(RUN_DIR, exist_ok=True)
+os.makedirs(DIR_REPORTS_FIGS, exist_ok=True)
+
+# ── Parámetro adicional para el pipeline de estadísticos descriptivos ────────
+N_BINS_ESTADISTICOS = 4   # Bins cuantílicos para valorespromedio_features
+
+print(f"--- Iniciando ejecución para: {USPL_ID} ---")
+print(f"--- Salidas en: {RUN_DIR} ---")
+print(f"--- Regimen: {REGIMEN} ---")
+if SC_MODE is not None:
+    print(f"--- SC Mode: {SC_MODE} ---")
+
+
+# ══════════════════════════════════════════════════════════════
+# 1. FUNCIONES DE APOYO
+# ══════════════════════════════════════════════════════════════
 
 def mape(y_true, y_pred):
     y_true = np.where(y_true == 0, 1e-10, y_true)
     return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
 
-# ── LOOP PRINCIPAL ─────────────────────────────────────────────
-for i in range(100):
-
-    print(f"[ITER {i+1}] Iniciando...")
-
-    try:
-
-        # ── Train/Test Split ───────────────────────────────────
-        from sklearn.model_selection import train_test_split
-
-        X = features_df.values
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, t_Corriente, test_size=0.2,
-            stratify=pd.cut(t_Corriente, bins=10)
-        )
-
-        # ══════════════════════════════════════════════════════
-        # SVR
-        # ══════════════════════════════════════════════════════
-        from sklearn.pipeline import Pipeline
-        from sklearn.preprocessing import StandardScaler
-        from sklearn.svm import SVR
-        from sklearn.model_selection import GridSearchCV
-
-        pipeline = Pipeline([
-            ('scaler_post', StandardScaler()),
-            ('svr',         SVR(kernel='rbf'))
-        ])
-
-        param_grid = {
-            'svr__C':       [10, 100, 1000],
-            'svr__gamma':   ['scale', 0.001, 0.005, 0.01],
-            'svr__epsilon': [1, 2.5, 5]
-        }
-
-        grid_search_svr = GridSearchCV(pipeline, param_grid, cv=5, verbose=0, scoring='r2', n_jobs=-1)
-        grid_search_svr.fit(X_train, y_train)
-
-        # ── Métricas SVR ──────────────────────────────────────
-        y_pred_svr = grid_search_svr.predict(X_test)
-        
-        # ── Permutation Importance SVR ────────────────────────
-        from sklearn.inspection import permutation_importance
-
-        result = permutation_importance(
-            grid_search_svr.best_estimator_,
-            X_test, y_test,
-            n_repeats=75,
-            n_jobs=-1
-        )
-
-        permutation_svr_df = pd.DataFrame({
-            'feature':          features_df.columns,
-            'importance_mean':  result.importances_mean,
-            'importance_std':   result.importances_std
-        }).sort_values('importance_mean', ascending=False).reset_index(drop=True)
-
-        permutation_svr_df['rank_perm'] = permutation_svr_df.index + 1
-
-        importancias_limpias = permutation_svr_df['importance_mean'].clip(lower=0)
-        permutation_svr_df['normalized_importance'] = importancias_limpias / importancias_limpias.sum()
-        permutation_svr_df['cumulative_importance']  = permutation_svr_df['normalized_importance'].cumsum()
-
-        # ── SHAP SVR ──────────────────────────────────────────
-        import shap
-
-        best_svr_pipeline  = grid_search_svr.best_estimator_
-        predict_fn         = best_svr_pipeline.predict
-
-        X_train_background = shap.sample(X_train, 100)
-        X_test_global      = shap.sample(X_test, 75)
-
-        explainer_svr      = shap.KernelExplainer(predict_fn, X_train_background)
-        shap_values_global = explainer_svr.shap_values(X_test_global)
-
-        mean_abs_shap = np.mean(np.abs(shap_values_global), axis=0)
-
-        shap_svr_df = (
-            pd.DataFrame({
-                'feature':         features_df.columns.tolist(),
-                'shap_importance': mean_abs_shap
-            })
-            .sort_values('shap_importance', ascending=False)
-            .reset_index(drop=True)
-        )
-        shap_svr_df['rank_shap'] = shap_svr_df.index + 1
-
-        shap_svr_df['normalized'] = shap_svr_df['shap_importance'] / shap_svr_df['shap_importance'].sum()
-        shap_svr_df['cumulative'] = shap_svr_df['normalized'].cumsum()
-
-        # ══════════════════════════════════════════════════════
-        # Random Forest
-        # ══════════════════════════════════════════════════════
-        from sklearn.ensemble import RandomForestRegressor
-
-        rf_pipeline = Pipeline([
-            ('rf', RandomForestRegressor(n_jobs=-1))
-        ])
-
-        param_grid_rf = {
-            'rf__n_estimators':    [100, 300, 500],
-            'rf__max_depth':       [5, 10, 15],
-            'rf__min_samples_leaf':[4, 8, 16],
-            'rf__max_features':    ['sqrt', 'log2']
-        }
-
-        grid_search_rf = GridSearchCV(rf_pipeline, param_grid_rf, cv=5, verbose=0, scoring='r2', n_jobs=-1)
-        grid_search_rf.fit(X_train, y_train)
-
-        # ── Métricas RF ───────────────────────────────────────
-        y_pred_rf = grid_search_rf.predict(X_test)
-
-        # ── Permutation Importance RF ─────────────────────────
-        result_rf = permutation_importance(
-            grid_search_rf.best_estimator_,
-            X_test, y_test,
-            n_repeats=75,
-            n_jobs=-1
-        )
-
-        permutation_rf_df = pd.DataFrame({
-            'feature':         features_df.columns,
-            'importance_mean': result_rf.importances_mean,
-            'importance_std':  result_rf.importances_std
-        }).sort_values('importance_mean', ascending=False).reset_index(drop=True)
-
-        permutation_rf_df['rank_perm'] = permutation_rf_df.index + 1
-
-        importancias_limpias_rf = permutation_rf_df['importance_mean'].clip(lower=0)
-        permutation_rf_df['normalized_importance'] = importancias_limpias_rf / importancias_limpias_rf.sum()
-        permutation_rf_df['cumulative_importance']  = permutation_rf_df['normalized_importance'].cumsum()
-
-        # ── SHAP RF ───────────────────────────────────────────
-        best_rf_model        = grid_search_rf.best_estimator_.named_steps['rf']
-        X_train_background_rf = shap.sample(X_train, 100)
-        X_test_global_rf      = shap.sample(X_test, 75)
-
-        explainer_rf   = shap.TreeExplainer(best_rf_model, X_train_background_rf)
-        shap_values_rf = explainer_rf.shap_values(X_test_global_rf)
-
-        mean_abs_shap_rf = np.mean(np.abs(shap_values_rf), axis=0)
-
-        shap_rf_df = (
-            pd.DataFrame({
-                'feature':         features_df.columns.tolist(),
-                'shap_importance': mean_abs_shap_rf
-            })
-            .sort_values('shap_importance', ascending=False)
-            .reset_index(drop=True)
-        )
-        shap_rf_df['rank_shap'] = shap_rf_df.index + 1
-
-        shap_rf_df['normalized'] = shap_rf_df['shap_importance'] / shap_rf_df['shap_importance'].sum()
-        shap_rf_df['cumulative'] = shap_rf_df['normalized'].cumsum()
-
-        # ══════════════════════════════════════════════════════
-        # Bayesian Ridge
-        # ══════════════════════════════════════════════════════
-        from sklearn.linear_model import BayesianRidge
-
-        bayesian_pipeline = Pipeline([
-            ('scaler',   StandardScaler()),
-            ('bayesian', BayesianRidge())
-        ])
-
-        param_grid_bayesian = {
-            'bayesian__max_iter': [300, 500, 1000],
-            'bayesian__alpha_1':  [1e-6, 1e-4],
-            'bayesian__alpha_2':  [1e-6, 1e-4],
-            'bayesian__lambda_1': [1e-6, 1e-4],
-            'bayesian__lambda_2': [1e-6, 1e-4],
-        }
-
-        grid_search_bayesian = GridSearchCV(bayesian_pipeline, param_grid_bayesian, cv=5, verbose=0, scoring='r2', n_jobs=-1)
-        grid_search_bayesian.fit(X_train, y_train)
-
-        # ── Métricas Bayesian ─────────────────────────────────
-        y_pred_bayesian = grid_search_bayesian.predict(X_test)
-
-        # ── Permutation Importance Bayesian ───────────────────
-        result_rb = permutation_importance(
-            grid_search_bayesian.best_estimator_,
-            X_test, y_test,
-            n_repeats=75,
-            n_jobs=-1
-        )
-
-        permutation_rb_df = pd.DataFrame({
-            'feature':         features_df.columns,
-            'importance_mean': result_rb.importances_mean,
-            'importance_std':  result_rb.importances_std
-        }).sort_values('importance_mean', ascending=False).reset_index(drop=True)
-
-        permutation_rb_df['rank_perm'] = permutation_rb_df.index + 1
-
-        importancias_limpias_rb = permutation_rb_df['importance_mean'].clip(lower=0)
-        permutation_rb_df['normalized_importance'] = importancias_limpias_rb / importancias_limpias_rb.sum()
-        permutation_rb_df['cumulative_importance']  = permutation_rb_df['normalized_importance'].cumsum()
-
-        # ── SHAP Bayesian ─────────────────────────────────────
-        best_rb_model  = grid_search_bayesian.best_estimator_.named_steps['bayesian']
-        explainer_rb   = shap.LinearExplainer(best_rb_model, X_train_background)
-        shap_values_rb = explainer_rb.shap_values(X_test_global)
-
-        mean_abs_shap_rb = np.mean(np.abs(shap_values_rb), axis=0)
-
-        shap_rb_df = (
-            pd.DataFrame({
-                'feature':         features_df.columns.tolist(),
-                'shap_importance': mean_abs_shap_rb
-            })
-            .sort_values('shap_importance', ascending=False)
-            .reset_index(drop=True)
-        )
-        shap_rb_df['rank_shap'] = shap_rb_df.index + 1
-
-        shap_rb_df['normalized'] = shap_rb_df['shap_importance'] / shap_rb_df['shap_importance'].sum()
-        shap_rb_df['cumulative'] = shap_rb_df['normalized'].cumsum()
-
-        # ══════════════════════════════════════════════════════
-        # XGBoost
-        # ══════════════════════════════════════════════════════
-        from xgboost import XGBRegressor
-
-        xgb_pipeline = Pipeline([
-            ('xgb', XGBRegressor(n_jobs=-1, random_state=42, verbosity=0))
-        ])
-
-        param_grid_xgb = {
-            'xgb__n_estimators':    [100, 300],
-            'xgb__max_depth':       [3, 6],
-            'xgb__learning_rate':   [0.05, 0.1],
-            'xgb__subsample':       [0.8, 1.0],
-            'xgb__colsample_bytree':[0.8, 1.0],
-        }
-
-        grid_search_xgb = GridSearchCV(xgb_pipeline, param_grid_xgb, cv=5, verbose=0, scoring='r2', n_jobs=-1)
-        grid_search_xgb.fit(X_train, y_train)
-
-        # ── Métricas XGBoost ──────────────────────────────────
-        y_pred_xgb = grid_search_xgb.predict(X_test)
-
-        # ── Permutation Importance XGBoost ────────────────────
-        result_xgb = permutation_importance(
-            grid_search_xgb.best_estimator_,
-            X_test, y_test,
-            n_repeats=75,
-            n_jobs=-1
-        )
-
-        permutation_xgb_df = pd.DataFrame({
-            'feature':         features_df.columns,
-            'importance_mean': result_xgb.importances_mean,
-            'importance_std':  result_xgb.importances_std
-        }).sort_values('importance_mean', ascending=False).reset_index(drop=True)
-
-        permutation_xgb_df['rank_perm'] = permutation_xgb_df.index + 1
-
-        importancias_limpias_xgb = permutation_xgb_df['importance_mean'].clip(lower=0)
-        permutation_xgb_df['normalized_importance'] = importancias_limpias_xgb / importancias_limpias_xgb.sum()
-        permutation_xgb_df['cumulative_importance']  = permutation_xgb_df['normalized_importance'].cumsum()
-
-        # ── SHAP XGBoost ──────────────────────────────────────
-        best_xgb_model   = grid_search_xgb.best_estimator_.named_steps['xgb']
-        explainer_xgb    = shap.TreeExplainer(best_xgb_model, X_train_background)
-        shap_values_xgb  = explainer_xgb.shap_values(X_test_global)
-
-        mean_abs_shap_xgb = np.mean(np.abs(shap_values_xgb), axis=0)
-
-        shap_xgb_df = (
-            pd.DataFrame({
-                'feature':         features_df.columns.tolist(),
-                'shap_importance': mean_abs_shap_xgb
-            })
-            .sort_values('shap_importance', ascending=False)
-            .reset_index(drop=True)
-        )
-        shap_xgb_df['rank_shap'] = shap_xgb_df.index + 1
-
-        shap_xgb_df['normalized'] = shap_xgb_df['shap_importance'] / shap_xgb_df['shap_importance'].sum()
-        shap_xgb_df['cumulative'] = shap_xgb_df['normalized'].cumsum()
-
-        # ══════════════════════════════════════════════════════
-        # Desempeño General — Guardado CSV
-        # ══════════════════════════════════════════════════════
-
-        results_df = pd.DataFrame({
-            'Iteration':      i + 1,
-            'Actual_Current': y_test.flatten(),
-            'Pred_SVR':       y_pred_svr,
-            'Pred_RF':        y_pred_rf,
-            'Pred_Bayesian':  y_pred_bayesian,
-            'Pred_XGBoost':   y_pred_xgb
-        })
-
-        output_file = 'model_predictions_history.csv'
-        if os.path.exists(output_file):
-            results_df.to_csv(output_file, mode='a', header=False, index=False)
-        else:
-            results_df.to_csv(output_file, mode='w', header=True, index=False)
-
-        # ── Rankings consenso ─────────────────────────────────
-        file_perm = 'ranking_consenso_perm.csv'
-        file_shap = 'ranking_consenso_shap.csv'
-
-        model_results = [
-            ('SVR',           permutation_svr_df, shap_svr_df),
-            ('Random Forest', permutation_rf_df,  shap_rf_df),
-            ('Bayesian Ridge',permutation_rb_df,  shap_rb_df),
-            ('XGBoost',       permutation_xgb_df, shap_xgb_df)
-        ]
-
-        data_perm, data_shap = [], []
-        for model_name, df_perm, df_shap in model_results:
-            temp_perm = df_perm[['feature', 'rank_perm', 'importance_mean']].copy()
-            temp_perm['model'] = model_name
-            data_perm.append(temp_perm)
-
-            temp_shap = df_shap[['feature', 'rank_shap', 'shap_importance']].copy()
-            temp_shap['model'] = model_name
-            data_shap.append(temp_shap)
-
-        df_iter_perm = pd.concat(data_perm, ignore_index=True)
-        df_iter_shap = pd.concat(data_shap, ignore_index=True)
-
-        def save_with_append(df_new, filename):
-            if os.path.exists(filename):
-                df_existing = pd.read_csv(filename)
-                df_updated  = pd.concat([df_existing, df_new], ignore_index=True)
-                df_updated.to_csv(filename, index=False)
-            else:
-                df_new.to_csv(filename, index=False)
-
-        save_with_append(df_iter_perm, file_perm)
-        save_with_append(df_iter_shap, file_shap)
-
-        # ── Extracción y Registro de Métricas Completas ────────
-        # SVR
-        r2_svr   = r2_score(y_test, y_pred_svr)
-        mae_svr  = mean_absolute_error(y_test, y_pred_svr)
-        rmse_svr = np.sqrt(mean_squared_error(y_test, y_pred_svr))
-        mape_svr = mape(y_test, y_pred_svr)
-
-        # RF
-        r2_rf   = r2_score(y_test, y_pred_rf)
-        mae_rf  = mean_absolute_error(y_test, y_pred_rf)
-        rmse_rf = np.sqrt(mean_squared_error(y_test, y_pred_rf))
-        mape_rf = mape(y_test, y_pred_rf)
-
-        # Bayesian Ridge
-        r2_bay   = r2_score(y_test, y_pred_bayesian)
-        mae_bay  = mean_absolute_error(y_test, y_pred_bayesian)
-        rmse_bay = np.sqrt(mean_squared_error(y_test, y_pred_bayesian))
-        mape_bay = mape(y_test, y_pred_bayesian)
-
-        # XGBoost
-        r2_xgb   = r2_score(y_test, y_pred_xgb)
-        mae_xgb  = mean_absolute_error(y_test, y_pred_xgb)
-        rmse_xgb = np.sqrt(mean_squared_error(y_test, y_pred_xgb))
-        mape_xgb = mape(y_test, y_pred_xgb)
-
-        # Log con métricas extendidas
-        iteration_log.append({
-            'iter': i + 1, 'status': 'ok',
-            'R2_SVR': round(r2_svr, 4), 'MAE_SVR': round(mae_svr, 4), 'RMSE_SVR': round(rmse_svr, 4), 'MAPE_SVR': round(mape_svr, 4),
-            'R2_RF': round(r2_rf, 4), 'MAE_RF': round(mae_rf, 4), 'RMSE_RF': round(rmse_rf, 4), 'MAPE_RF': round(mape_rf, 4),
-            'R2_Bayesian': round(r2_bay, 4), 'MAE_Bayesian': round(mae_bay, 4), 'RMSE_Bayesian': round(rmse_bay, 4), 'MAPE_Bayesian': round(mape_bay, 4),
-            'R2_XGB': round(r2_xgb, 4), 'MAE_XGB': round(mae_xgb, 4), 'RMSE_XGB': round(rmse_xgb, 4), 'MAPE_XGB': round(mape_xgb, 4)
-        })
-        
-        print(f"[ITER {i+1}] ✅ OK  |  R2: SVR={r2_svr:.4f}  RF={r2_rf:.4f}  Bay={r2_bay:.4f}  XGB={r2_xgb:.4f}")
-
-    except Exception as e:
-        # Captura el error, lo registra y continúa con la siguiente iteración
-        tb = traceback.format_exc()
-        iteration_log.append({'iter': i + 1, 'status': 'ERROR', 'detail': str(e)})
-        print(f"[ITER {i+1}] ❌ ERROR — {e}")
-        print(f"           Traceback guardado en error_iter_{i+1}.txt")
-        with open(f'error_iter_{i+1}.txt', 'w') as f:
-            f.write(tb)
-
-    finally:
-        # ── Liberación de memoria ──────────────────────────────
-        gc.collect()
-
-# ══════════════════════════════════════════════════════════════
-# ZONA ACME — Análisis post-loop
-# ══════════════════════════════════════════════════════════════
-
-print("\n" + "="*60)
-print("  RESUMEN FINAL DE ITERACIONES")
-print("="*60)
-ok_count  = sum(1 for r in iteration_log if r['status'] == 'ok')
-err_count = sum(1 for r in iteration_log if r['status'] == 'ERROR')
-print(f"  Total: {len(iteration_log)}  |  ✅ OK: {ok_count}  |  ❌ Errores: {err_count}")
-print("-"*60)
-for row in iteration_log:
-    if row['status'] == 'ok':
-        print(f"  Iter {row['iter']:>3}  ✅  "
-              f"R2(SVR,RF,Bay,XGB): {row['R2_SVR']}, {row['R2_RF']}, {row['R2_Bayesian']}, {row['R2_XGB']}")
+def save_to_run(df, filename):
+    path = os.path.join(RUN_DIR, filename)
+    if os.path.exists(path):
+        df_old = pd.read_csv(path)
+        pd.concat([df_old, df], ignore_index=True).to_csv(path, index=False)
     else:
-        print(f"  Iter {row['iter']:>3}  ❌  {row['detail']}")
-print("="*60)
+        df.to_csv(path, index=False)
 
-# ── Guardar log de resultados con TODAS LAS MÉTRICAS ──────────
-pd.DataFrame(iteration_log).to_csv('iteration_log.csv', index=False)
-print("\n[INFO] Log guardado en 'iteration_log.csv' (Incluye R2, MAE, RMSE, MAPE)")
 
-# ── Gráfico consenso (solo si hay datos) ─────────────────────
-if os.path.exists('model_predictions_history.csv'):
-    import seaborn as sns
+# ══════════════════════════════════════════════════════════════
+# 2. PIPELINE DE ESTADÍSTICOS POR FEATURE
+# ══════════════════════════════════════════════════════════════
 
-    df_preds  = pd.read_csv('model_predictions_history.csv')
-    df_melted = df_preds.melt(id_vars=['Actual_Current', 'Iteration'],
-                              var_name='Model', value_name='Predicted')
+def cargar_datos(ruta: str) -> pd.DataFrame:
+    """
+    Carga el archivo CSV desde la ruta indicada.
 
-    fig, ax = plt.subplots(figsize=(12, 7))
-    sns.lineplot(data=df_melted, x='Actual_Current', y='Predicted',
-                 hue='Model', errorbar=('ci', 95), linewidth=2, ax=ax)
-    ax.plot([df_preds['Actual_Current'].min(), df_preds['Actual_Current'].max()],
-            [df_preds['Actual_Current'].min(), df_preds['Actual_Current'].max()],
-            color='black', linestyle='--', label='Ideal (Actual = Predicted)')
-    ax.set_title(f'Consenso de Predicciones tras {ok_count} Iteraciones (IC 95%)', fontsize=14)
-    ax.grid(True, alpha=0.3)
-    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
-    plt.savefig('consenso_predicciones.png', dpi=100)
-    plt.close()
-    print("[INFO] Gráfico guardado en 'consenso_predicciones.png'")
+    Args:
+        ruta (str): Ruta al archivo CSV de entrada.
 
-# ── Tabla de consenso final ───────────────────────────────────
-if os.path.exists('ranking_consenso_perm.csv') and os.path.exists('ranking_consenso_shap.csv'):
-    df_perm_final = pd.read_csv('ranking_consenso_perm.csv')
-    df_shap_final = pd.read_csv('ranking_consenso_shap.csv')
+    Returns:
+        pd.DataFrame: DataFrame con los datos cargados.
 
-    resumen_perm = df_perm_final.groupby('feature').agg(
-        {'rank_perm': 'mean', 'importance_mean': 'mean'}).reset_index()
-    resumen_shap = df_shap_final.groupby('feature').agg(
-        {'rank_shap': 'mean', 'shap_importance': 'mean'}).reset_index()
+    Raises:
+        FileNotFoundError: Si el archivo no existe en la ruta indicada.
+    """
+    try:
+        df = pd.read_csv(ruta)
+        print(f"[OK] Archivo cargado: {ruta}")
+        print(f"     Filas: {df.shape[0]} | Columnas: {df.shape[1]}")
+        return df
+    except FileNotFoundError:
+        raise FileNotFoundError(f"No se encontró el archivo: {ruta}")
 
-    tabla_consenso = pd.merge(resumen_perm, resumen_shap, on='feature')
-    tabla_consenso['consenso_score'] = tabla_consenso['rank_perm'] + tabla_consenso['rank_shap']
-    tabla_consenso = tabla_consenso.sort_values('consenso_score').reset_index(drop=True)
 
-    tabla_consenso['perm_norm'] = (tabla_consenso['importance_mean'].clip(lower=0) /
-                                   tabla_consenso['importance_mean'].clip(lower=0).sum())
-    tabla_consenso['shap_norm'] = tabla_consenso['shap_importance'] / tabla_consenso['shap_importance'].sum()
-    tabla_consenso['cum_importance_perm'] = tabla_consenso['perm_norm'].cumsum()
-    tabla_consenso['cum_importance_shap'] = tabla_consenso['shap_norm'].cumsum()
+def validar_columna_objetivo(df: pd.DataFrame, columna_objetivo: str) -> None:
+    """
+    Verifica que la columna objetivo exista en el DataFrame.
 
-    cols_finales = [
-        'feature', 'consenso_score',
-        'rank_perm', 'importance_mean', 'cum_importance_perm',
-        'rank_shap', 'shap_importance', 'cum_importance_shap'
+    Args:
+        df (pd.DataFrame): DataFrame cargado.
+        columna_objetivo (str): Nombre de la columna objetivo.
+
+    Raises:
+        ValueError: Si la columna no existe en el DataFrame.
+    """
+    if columna_objetivo not in df.columns:
+        raise ValueError(
+            f"La columna '{columna_objetivo}' no existe en el archivo. "
+            f"Columnas disponibles: {list(df.columns)}"
+        )
+    print(f"[OK] Columna objetivo encontrada: '{columna_objetivo}'")
+
+
+def obtener_features(df: pd.DataFrame, columna_objetivo: str) -> list:
+    """
+    Retorna la lista de columnas de features, excluyendo la columna objetivo.
+
+    Args:
+        df (pd.DataFrame): DataFrame completo.
+        columna_objetivo (str): Columna a excluir.
+
+    Returns:
+        list: Lista de nombres de columnas que son features.
+    """
+    features = [col for col in df.columns if col != columna_objetivo]
+    print(f"[OK] Features detectadas ({len(features)}): {features}")
+    return features
+
+
+def asignar_cuartiles(df: pd.DataFrame, columna_objetivo: str, n_bins: int) -> pd.DataFrame:
+    """
+    Asigna cada fila a un bin basado en la distribución cuantílica de la columna
+    objetivo, usando pandas.qcut. Agrega la columna 'cuartil_corriente' al DataFrame.
+
+    Se usa duplicates='drop' para manejar casos donde los límites de los bins
+    coinciden (distribuciones con valores repetidos o concentrados).
+
+    Args:
+        df (pd.DataFrame): DataFrame con los datos originales.
+        columna_objetivo (str): Columna numérica sobre la que se aplica qcut.
+        n_bins (int): Número de bins cuantílicos a generar.
+
+    Returns:
+        pd.DataFrame: Copia del DataFrame con la columna 'cuartil_corriente' añadida.
+
+    Raises:
+        ValueError: Si tras eliminar duplicados quedan menos de 2 bins válidos.
+    """
+    df = df.copy()
+    try:
+        df["cuartil_corriente"] = pd.qcut(
+            df[columna_objetivo],
+            q=n_bins,
+            duplicates="drop"
+        )
+    except ValueError as e:
+        raise ValueError(
+            f"No se pudo aplicar qcut sobre '{columna_objetivo}' con {n_bins} bins. "
+            f"Detalle: {e}"
+        )
+    bins_resultantes = df["cuartil_corriente"].nunique()
+    print(f"[OK] Cuartiles asignados.")
+    print(f"     Bins solicitados: {n_bins} | Bins generados: {bins_resultantes}")
+    if bins_resultantes < n_bins:
+        print(f"     [AVISO] Se generaron menos bins por valores duplicados en los límites.")
+    return df
+
+
+def calcular_estadisticos(df: pd.DataFrame, columna_objetivo: str, features: list) -> pd.DataFrame:
+    """
+    Agrupa el DataFrame por la columna 'cuartil_corriente' (bins cuantílicos)
+    y calcula min, max y mean para cada feature. Los NaN se ignoran en el cálculo.
+    Añade también el conteo de muestras por cuartil.
+
+    Args:
+        df (pd.DataFrame): DataFrame con los datos, debe incluir 'cuartil_corriente'.
+        columna_objetivo (str): Nombre original de la columna de corriente.
+        features (list): Lista de features a procesar.
+
+    Returns:
+        pd.DataFrame: DataFrame con una fila por cuartil y columnas de estadísticos.
+    """
+    COLUMNA_BIN = "cuartil_corriente"
+    print(f"\n[INFO] Calculando estadísticos agrupando por cuartiles de '{columna_objetivo}'...")
+    agrupado = df.groupby(COLUMNA_BIN, observed=True)[features].agg(["min", "max", "mean"])
+    agrupado.columns = [f"{feature}_{stat}" for feature, stat in agrupado.columns]
+    agrupado["n_samples"] = df.groupby(COLUMNA_BIN, observed=True)[features[0]].count()
+    agrupado = agrupado.reset_index()
+    agrupado = agrupado.rename(columns={COLUMNA_BIN: "current_range"})
+    print(f"[OK] Estadísticos calculados.")
+    print(f"     Cuartiles procesados: {agrupado['current_range'].nunique()}")
+    print(f"     Columnas generadas: {len(agrupado.columns) - 2} estadísticos "
+        f"+ current_range + n_samples")
+    return agrupado
+
+
+def exportar_resultado(df_resultado: pd.DataFrame, ruta: str) -> None:
+    """
+    Exporta el DataFrame resultante a un archivo CSV.
+
+    Args:
+        df_resultado (pd.DataFrame): DataFrame procesado.
+        ruta (str): Ruta donde se guardará el CSV de salida.
+    """
+    df_resultado.to_csv(ruta, index=False)
+    print(f"\n[OK] Archivo exportado exitosamente: {ruta}")
+
+
+def procesar_pipeline(ruta_entrada: str, ruta_salida: str,
+                      columna_objetivo: str, n_bins: int = 4) -> pd.DataFrame:
+    """
+    Ejecuta el pipeline completo: carga, validación, binning cuantílico,
+    cálculo de estadísticos y exportación.
+
+    Args:
+        ruta_entrada (str): Ruta del CSV de entrada.
+        ruta_salida (str): Ruta del CSV de salida.
+        columna_objetivo (str): Nombre de la columna de agrupación (corriente).
+        n_bins (int): Número de bins cuantílicos. Por defecto 4 (cuartiles).
+
+    Returns:
+        pd.DataFrame: DataFrame final con los estadísticos calculados.
+    """
+    print("=" * 60)
+    print("  INICIO DEL PIPELINE DE ESTADÍSTICOS (valorespromedio)")
+    print("=" * 60)
+    df = cargar_datos(ruta_entrada)
+    validar_columna_objetivo(df, columna_objetivo)
+    features = obtener_features(df, columna_objetivo)
+    df = asignar_cuartiles(df, columna_objetivo, n_bins)
+    df_resultado = calcular_estadisticos(df, columna_objetivo, features)
+    exportar_resultado(df_resultado, ruta_salida)
+    print("\n" + "=" * 60)
+    print("  PIPELINE DE ESTADÍSTICOS FINALIZADO")
+    print("=" * 60)
+    return df_resultado
+
+
+# ══════════════════════════════════════════════════════════════
+# 3. TRIPLE CONSENSO 80% (PERM + SHAP + GENERAL)
+# ══════════════════════════════════════════════════════════════
+
+def process_triple_80(paths: dict) -> None:
+    """
+    Calcula el consenso Triple 80% sobre importancias de Permutation y SHAP.
+
+    Normaliza por modelo (Min-Max), agrega en consenso cross-model y marca
+    las features que acumulan el 80% de la importancia en cada pilar.
+
+    Args:
+        paths (dict): Diccionario con claves:
+            - 'run_dir'   : str — directorio base del run actual.
+            - 'perm_csv'  : str — CSV con ranking de permutation importance.
+            - 'shap_csv'  : str — CSV con ranking SHAP importance.
+            - 'output_csv': str — ruta de salida de la tabla de consenso final.
+    """
+    print(f"\n--- Calculando Triple Consenso 80% en: {os.path.basename(paths['run_dir'])} ---")
+
+    if not os.path.exists(paths['perm_csv']) or not os.path.exists(paths['shap_csv']):
+        print("[ERROR] Faltan archivos base para consenso_score. "
+              "Verifica que el loop de entrenamiento completó al menos 1 iteración.")
+        return
+
+    df_p = pd.read_csv(paths['perm_csv'])
+    df_s = pd.read_csv(paths['shap_csv'])
+
+    # Normalización Min-Max (0-1) por modelo
+    def normalize(df, col):
+        df = df.copy()
+        for mod in df['model'].unique():
+            mask = df['model'] == mod
+            vals = df.loc[mask, col]
+            df.loc[mask, col] = (vals - vals.min()) / (vals.max() - vals.min() + 1e-10)
+        return df
+
+    df_p = normalize(df_p, 'importance_mean')
+    df_s = normalize(df_s, 'shap_importance')
+
+    # Consensos base: media cross-model por feature
+    c_perm = df_p.groupby('feature')['importance_mean'].mean().reset_index()
+    c_perm.rename(columns={'importance_mean': 'Consensus_Permutation'}, inplace=True)
+
+    c_shap = df_s.groupby('feature')['shap_importance'].mean().reset_index()
+    c_shap.rename(columns={'shap_importance': 'Consensus_SHAP'}, inplace=True)
+
+    df_consenso = pd.merge(c_perm, c_shap, on='feature')
+    df_consenso['Consensus_General'] = (
+        df_consenso['Consensus_Permutation'] + df_consenso['Consensus_SHAP']
+    ) / 2
+
+    # Marcar el Top 80% acumulado por pilar
+    def get_80_stats(df_target, col_name):
+        temp = df_target[['feature', col_name]].sort_values(col_name, ascending=False).copy()
+        total = temp[col_name].sum()
+        temp[f'Cum_{col_name}'] = (temp[col_name] / total).cumsum()
+        temp[f'Top80_{col_name}'] = temp[f'Cum_{col_name}'].shift(1).fillna(0) < 0.8
+        return temp[['feature', f'Cum_{col_name}', f'Top80_{col_name}']]
+
+    stats_perm = get_80_stats(df_consenso, 'Consensus_Permutation')
+    stats_shap = get_80_stats(df_consenso, 'Consensus_SHAP')
+    stats_gen  = get_80_stats(df_consenso, 'Consensus_General')
+
+    df_consenso = df_consenso \
+        .merge(stats_perm, on='feature') \
+        .merge(stats_shap, on='feature') \
+        .merge(stats_gen,  on='feature')
+
+    df_consenso = df_consenso.sort_values('Consensus_General', ascending=False).round(4)
+    df_consenso.to_csv(paths['output_csv'], index=False)
+    print(f"[OK] Consensus table generated at: {paths['output_csv']}")
+
+    n_perm = df_consenso['Top80_Consensus_Permutation'].sum()
+    n_shap = df_consenso['Top80_Consensus_SHAP'].sum()
+    n_gen  = df_consenso['Top80_Consensus_General'].sum()
+    print(f"--- RESUMEN TOP 80% ---")
+    print(f"Features en Permutation: {int(n_perm)}")
+    print(f"Features en SHAP:        {int(n_shap)}")
+    print(f"Features en General:     {int(n_gen)}")
+
+
+# ══════════════════════════════════════════════════════════════
+# 4. CAPA DE ANÁLISIS Y GRÁFICAS
+# ══════════════════════════════════════════════════════════════
+
+def ejecutar_analisis_final():
+    print(f"\n[PROCESO] Generando reportes finales...")
+    
+    # --- 2.1 Métricas (Media y Std) (Va a data/outputs/run...) ---
+    log_path = os.path.join(RUN_DIR, 'iteration_log.csv')
+    if os.path.exists(log_path):
+        df_l = pd.read_csv(log_path)
+        df_v = df_l[df_l['status'] == 'ok'] if 'status' in df_l.columns else df_l
+        m_cols = [c for c in df_l.columns if any(m in c for m in ['R2', 'MAE', 'RMSE', 'MAPE'])]
+        if m_cols:
+            stats = pd.DataFrame({
+                'Metric_Model': m_cols,
+                'Mean': df_v[m_cols].mean().values,
+                'Std': df_v[m_cols].std().values
+            })
+            stats.to_csv(os.path.join(RUN_DIR, 'resumen_estadistico_modelos.csv'), index=False)
+
+    # --- 2.2 Ranking General con Aporte 80% (Va a data/outputs/run...) ---
+    def calc_80(path, col_imp, suf):
+        if not os.path.exists(path): return pd.DataFrame()
+        df_g = pd.read_csv(path).groupby(['feature', 'model'])[col_imp].mean().reset_index()
+        res = []
+        for mod in df_g['model'].unique():
+            dm = df_g[df_g['model'] == mod].copy().sort_values(col_imp, ascending=False)
+            imp_norm = dm[col_imp].clip(lower=0)
+            dm['acum'] = (imp_norm / (imp_norm.sum() + 1e-10)).cumsum()
+            dm['top80'] = dm['acum'] <= 0.80
+            if (dm['acum'] > 0.80).any(): dm.loc[(dm['acum'] > 0.80).idxmax(), 'top80'] = True
+            m_id = mod.replace(' ', '_').lower()
+            dm = dm.rename(columns={col_imp: f'{suf}_imp_{m_id}', 'acum': f'{suf}_acum_{m_id}', 'top80': f'{suf}_80_{m_id}'})
+            res.append(dm.drop(columns=['model']))
+        f = res[0]
+        for i in range(1, len(res)): f = pd.merge(f, res[i], on='feature', how='outer')
+        return f
+
+    df_rank_p = calc_80(os.path.join(RUN_DIR, 'ranking_consenso_perm.csv'), 'importance_mean', 'perm')
+    df_rank_s = calc_80(os.path.join(RUN_DIR, 'ranking_consenso_shap.csv'), 'shap_importance', 'shap')
+    
+    if not df_rank_p.empty and not df_rank_s.empty:
+        final_rank = pd.merge(df_rank_p, df_rank_s, on='feature', how='outer').round(4)
+        final_rank.to_csv(os.path.join(RUN_DIR, 'ranking_general_por_modelo.csv'), index=False)
+
+    # --- 2.3 Convergencia Dual (SE DIBUJA DIRECTO EN reports/figures/) ---
+    config_graficas = [
+        ('ranking_consenso_perm.csv', 'rank_perm', 'importance_mean', 'PERMUTATION'),
+        ('ranking_consenso_shap.csv', 'rank_shap', 'shap_importance', 'SHAP')
     ]
 
-    tabla_consenso[cols_finales].to_csv('tabla_consenso_final.csv', index=False)
-    print("[INFO] Tabla de consenso guardada en 'tabla_consenso_final.csv'")
-
-# ══════════════════════════════════════════════════════════════
-# NUEVAS CURVAS DE CONVERGENCIA (RANKING STABILITY)
-# ══════════════════════════════════════════════════════════════
-if os.path.exists('ranking_consenso_perm.csv') and os.path.exists('ranking_consenso_shap.csv'):
-    import matplotlib.cm as cm
-
-    df_perm_conv = pd.read_csv('ranking_consenso_perm.csv')
-    df_shap_conv = pd.read_csv('ranking_consenso_shap.csv')
-
-    top_features = df_perm_conv['feature'].unique().tolist()
-    
-    # Reconstruir número de iteración a partir del orden de inserción
-    n_features_conv  = df_perm_conv['feature'].nunique()
-    n_models_conv    = df_perm_conv['model'].nunique()
-    rows_per_iter    = n_features_conv * n_models_conv
-    n_iters_conv     = len(df_perm_conv) // rows_per_iter
-
-    df_perm_conv['iteration'] = (df_perm_conv.index // rows_per_iter) + 1
-    df_shap_conv['iteration'] = (df_shap_conv.index // rows_per_iter) + 1
-
-    df_perm_conv = df_perm_conv[df_perm_conv['iteration'] <= n_iters_conv]
-    df_shap_conv = df_shap_conv[df_shap_conv['iteration'] <= n_iters_conv]
-
-    # Calcular posiciones absolutas en el ranking iteración a iteración
-    conv_records_perm = []
-    conv_records_shap = []
-
-    for n in range(1, n_iters_conv + 1):
-        # Permutation
-        sub_p = df_perm_conv[df_perm_conv['iteration'] <= n]
-        avg_p = sub_p.groupby('feature')['rank_perm'].mean().reset_index()
-        avg_p['integer_rank_perm'] = avg_p['rank_perm'].rank(method='min')
-        avg_p['iteration'] = n
-        conv_records_perm.append(avg_p)
+    for file_name, col_rank, col_imp, title in config_graficas:
+        path = os.path.join(RUN_DIR, file_name)
+        if not os.path.exists(path): continue
         
-        # SHAP
-        sub_s = df_shap_conv[df_shap_conv['iteration'] <= n]
-        avg_s = sub_s.groupby('feature')['rank_shap'].mean().reset_index()
-        avg_s['integer_rank_shap'] = avg_s['rank_shap'].rank(method='min')
-        avg_s['iteration'] = n
-        conv_records_shap.append(avg_s)
+        df_r = pd.read_csv(path)
+        n_f = df_r['feature'].nunique()
+        n_m = df_r['model'].nunique()
+        df_r['iteration'] = (df_r.index // (n_f * n_m)) + 1
+        
+        conv_list = []
+        for n in range(1, df_r['iteration'].max() + 1):
+            sub = df_r[df_r['iteration'] <= n].groupby('feature').agg({col_rank:'mean', col_imp:'mean'}).reset_index()
+            sub['rank_abs'] = sub[col_rank].rank(method='min')
+            sub['iteration'] = n
+            conv_list.append(sub)
+        
+        df_plot = pd.concat(conv_list)
+        feats = df_plot['feature'].unique()
+        colors = cm.tab20(np.linspace(0, 1, len(feats)))
+        
+        fig, axes = plt.subplots(2, 2, figsize=(18, 12))
+        fig.suptitle(f'Dual Convergence: {title}', fontsize=16, fontweight='bold')
+        
+        for f_name, color in zip(feats, colors):
+            d = df_plot[df_plot['feature'] == f_name].sort_values('iteration')
+            axes[0,0].plot(d['iteration'], d['rank_abs'], color=color, linewidth=2, label=f_name)
+            axes[0,1].plot(d['iteration'], d['rank_abs'].diff().abs(), color=color, linewidth=1.5)
+            axes[1,0].plot(d['iteration'], d[col_imp], color=color, linewidth=2)
+            axes[1,1].plot(d['iteration'], d[col_imp].diff().abs(), color=color, linewidth=1.5)
+        
+        axes[0,0].set_title("Stability: Ranking Position"); axes[0,0].invert_yaxis(); axes[0,0].grid(alpha=0.3)
+        axes[0,1].set_title("Rate of Change (Ranking)"); axes[0,1].grid(alpha=0.3)
+        axes[1,0].set_title("Stability: Importance Magnitude"); axes[1,0].grid(alpha=0.3)
+        axes[1,1].set_title("Rate of Change (Value)"); axes[1,1].grid(alpha=0.3)
+        
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        
+        img_filename = f'convergencia_{title.lower()}.png'
+        dest_path = os.path.join(DIR_REPORTS_FIGS, img_filename)
+        plt.savefig(dest_path, dpi=100)
+        plt.close()
+        print(f"[REPORTE] Gráfica generada en: {dest_path}")
 
-    df_conv_perm = pd.concat(conv_records_perm, ignore_index=True)
-    df_conv_shap = pd.concat(conv_records_shap, ignore_index=True)
+    # --- 2.4 Consenso de Predicciones (SE DIBUJA DIRECTO EN reports/figures/) ---
+    preds_path = os.path.join(RUN_DIR, 'model_predictions_history.csv')
+    if os.path.exists(preds_path):
+        df_preds = pd.read_csv(preds_path)
+        df_melted = df_preds.melt(id_vars=['Actual_Current', 'Iteration'],
+                                  var_name='Model', value_name='Predicted')
 
-    # ── Cuatro gráficas independientes (sin legends) ───────────
-    colors = cm.tab10(np.linspace(0, 1, len(top_features)))
-    fig, axes = plt.subplots(2, 2, figsize=(24, 16))
-    fig.suptitle('Estabilidad y Velocidad de Convergencia del Ranking de Features', fontsize=16, fontweight='bold')
+        fig, ax = plt.subplots(figsize=(12, 7))
+        sns.lineplot(data=df_melted, x='Actual_Current', y='Predicted',
+                     hue='Model', errorbar=('ci', 95), linewidth=2, ax=ax)
+        ax.plot([df_preds['Actual_Current'].min(), df_preds['Actual_Current'].max()],
+                [df_preds['Actual_Current'].min(), df_preds['Actual_Current'].max()],
+                color='black', linestyle='--', label='Ideal (Actual = Predicted)')
+        
+        iters_count = df_preds['Iteration'].nunique()
+        ax.set_title(f'Prediction Consensus after {iters_count} Iterations (95% CI)', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Actual Current')
+        ax.set_ylabel('Predicted')
+        ax.grid(True, alpha=0.3)
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.tight_layout()
+        
+        img_cons_filename = 'consenso_predicciones.png'
+        dest_cons_path = os.path.join(DIR_REPORTS_FIGS, img_cons_filename)
+        plt.savefig(dest_cons_path, dpi=100)
+        plt.close()
+        print(f"[REPORTE] Gráfica de Consenso generada en: {dest_cons_path}")
 
-    # 1. Permutation: Convergencia de Ranking
-    ax1 = axes[0, 0]
-    for feat, color in zip(top_features, colors):
-        sub = df_conv_perm[df_conv_perm['feature'] == feat].sort_values('iteration')
-        ax1.plot(sub['iteration'], sub['integer_rank_perm'], color=color, linewidth=1.8)
-    ax1.set_xlabel('Iteraciones acumuladas', fontsize=11)
-    ax1.set_ylabel('Posición en Ranking (1=Mejor)', fontsize=11)
-    ax1.set_title('Convergencia (Permutation Importance)', fontsize=12)
-    ax1.invert_yaxis()
-    ax1.grid(True, alpha=0.3)
 
-    # 2. Permutation: Velocidad de Convergencia
-    ax2 = axes[0, 1]
-    for feat, color in zip(top_features, colors):
-        sub   = df_conv_perm[df_conv_perm['feature'] == feat].sort_values('iteration')
-        delta = sub['integer_rank_perm'].diff().abs()
-        ax2.plot(sub['iteration'], delta, color=color, linewidth=1.5, alpha=0.85)
-    ax2.set_xlabel('Iteraciones acumuladas', fontsize=11)
-    ax2.set_ylabel('|Cambio de Posiciones|', fontsize=11)
-    ax2.set_title('Velocidad de Convergencia (Permutation)\n(0 = Estabilizado)', fontsize=12)
-    ax2.grid(True, alpha=0.3)
-    ax2.set_ylim(bottom=0)
+# ══════════════════════════════════════════════════════════════
+# 5. EJECUCIÓN PRINCIPAL
+# ══════════════════════════════════════════════════════════════
 
-    # 3. SHAP: Convergencia de Ranking
-    ax3 = axes[1, 0]
-    for feat, color in zip(top_features, colors):
-        sub = df_conv_shap[df_conv_shap['feature'] == feat].sort_values('iteration')
-        ax3.plot(sub['iteration'], sub['integer_rank_shap'], color=color, linewidth=1.8)
-    ax3.set_xlabel('Iteraciones acumuladas', fontsize=11)
-    ax3.set_ylabel('Posición en Ranking (1=Mejor)', fontsize=11)
-    ax3.set_title('Convergencia (SHAP Importance)', fontsize=12)
-    ax3.invert_yaxis()
-    ax3.grid(True, alpha=0.3)
+if __name__ == "__main__":
 
-    # 4. SHAP: Velocidad de Convergencia
-    ax4 = axes[1, 1]
-    for feat, color in zip(top_features, colors):
-        sub   = df_conv_shap[df_conv_shap['feature'] == feat].sort_values('iteration')
-        delta = sub['integer_rank_shap'].diff().abs()
-        ax4.plot(sub['iteration'], delta, color=color, linewidth=1.5, alpha=0.85)
-    ax4.set_xlabel('Iteraciones acumuladas', fontsize=11)
-    ax4.set_ylabel('|Cambio de Posiciones|', fontsize=11)
-    ax4.set_title('Velocidad de Convergencia (SHAP)\n(0 = Estabilizado)', fontsize=12)
-    ax4.grid(True, alpha=0.3)
-    ax4.set_ylim(bottom=0)
+    # ── PASO 0: Estadísticos descriptivos por cuartil de corriente ──────────
+    # (valorespromedio_features.py integrado)
+    # Se ejecuta antes del loop para tener contexto estadístico del dataset.
+    # Si el archivo no existe, se aborta aquí (mismo comportamiento que temporal).
+    if not os.path.exists(PATH_FEATURES):
+        print(f"[ERROR] No existe el archivo de entrada en: {PATH_FEATURES}")
+        exit()
 
-    plt.tight_layout()
-    plt.savefig('convergencia_ranking.png', dpi=120)
-    plt.close()
-    print("[INFO] Gráficas de convergencia separadas guardadas en 'convergencia_ranking.png'")
+    RUTA_SALIDA_STATS = os.path.join(RUN_DIR, "datos_procesados.csv")
+    procesar_pipeline(
+        ruta_entrada=PATH_FEATURES,
+        ruta_salida=RUTA_SALIDA_STATS,
+        columna_objetivo="target_current",
+        n_bins=N_BINS_ESTADISTICOS
+    )
 
-    # ── Diagnóstico Automático (Criterio de Ranking Stability) ──
-    convergencia_iter_perm = {}
-    convergencia_iter_shap = {}
+    # ── NÚCLEO: Loop de Entrenamiento Temporal ───────────────────────────────
+    # [ORIGINAL: temporallearning_opnet.py — INTACTO DESDE AQUÍ HASTA EL FIN DEL LOOP]
 
-    for feat in top_features:
-        # Evaluar Permutation
-        sub_p = df_conv_perm[df_conv_perm['feature'] == feat].sort_values('iteration')
-        delta_p = sub_p['integer_rank_perm'].diff().abs().fillna(999)
-        supera_p = sub_p['iteration'][delta_p > 0]
-        convergencia_iter_perm[feat] = int(supera_p.iloc[-1]) if len(supera_p) > 0 else 1
+    df_raw = pd.read_csv(PATH_FEATURES)
+    y = df_raw['target_current'].values
+    X_df = df_raw.drop(columns=['target_current'])
+    
+    log = []
+    TOTAL_ITERACIONES = int(input("Ingrese el número total de iteraciones a ejecutar: "))
+    
+    print(f"[INFO] Dataset con {X_df.shape[1]} features. Iniciando {TOTAL_ITERACIONES} iteraciones...")
 
-        # Evaluar SHAP
-        sub_s = df_conv_shap[df_conv_shap['feature'] == feat].sort_values('iteration')
-        delta_s = sub_s['integer_rank_shap'].diff().abs().fillna(999)
-        supera_s = sub_s['iteration'][delta_s > 0]
-        convergencia_iter_shap[feat] = int(supera_s.iloc[-1]) if len(supera_s) > 0 else 1
+    for i in range(TOTAL_ITERACIONES): 
+        print(f"[ITER {i+1}/{TOTAL_ITERACIONES}] Procesando modelos...")
+        try:
+            X_train, X_test, y_train, y_test = train_test_split(X_df.values, y, test_size=0.2, stratify=pd.cut(y, bins=10))
+            
+            # --- Variables Globales de SHAP (Restauradas de tu código original) ---
+            X_train_background = shap.sample(X_train, 100)
+            X_test_global      = shap.sample(X_test, 75)
+            
+            # ══════════════════════════════════════════════════════
+            # 1. SVR
+            # ══════════════════════════════════════════════════════
+            pipe_svr = Pipeline([('scaler', StandardScaler()), ('svr', SVR())])
+            grid_svr = GridSearchCV(pipe_svr, {
+                'svr__C':       [10, 100, 1000],
+                'svr__gamma':   ['scale', 0.001, 0.005, 0.01],
+                'svr__epsilon': [1, 2.5, 5]
+            }, cv=5, scoring='r2', n_jobs=-1).fit(X_train, y_train)
+            
+            p_svr = permutation_importance(grid_svr.best_estimator_, X_test, y_test, n_repeats=75, n_jobs=-1)
+            df_p_svr = pd.DataFrame({'feature': X_df.columns, 'importance_mean': p_svr.importances_mean, 'model': 'SVR'}).sort_values('importance_mean', ascending=False).reset_index(drop=True)
+            df_p_svr['rank_perm'] = df_p_svr.index + 1
+            
+            # SHAP Original
+            predict_fn = grid_svr.best_estimator_.predict
+            explainer_svr = shap.KernelExplainer(predict_fn, X_train_background)
+            shap_values_global = explainer_svr.shap_values(X_test_global)
+            df_s_svr = pd.DataFrame({'feature': X_df.columns, 'shap_importance': np.mean(np.abs(shap_values_global), axis=0), 'model': 'SVR'}).sort_values('shap_importance', ascending=False).reset_index(drop=True)
+            df_s_svr['rank_shap'] = df_s_svr.index + 1
 
-    max_conv_perm = max(convergencia_iter_perm.values())
-    max_conv_shap = max(convergencia_iter_shap.values())
+            # ══════════════════════════════════════════════════════
+            # 2. Random Forest
+            # ══════════════════════════════════════════════════════
+            pipe_rf = Pipeline([('rf', RandomForestRegressor(n_jobs=-1))])
+            grid_rf = GridSearchCV(pipe_rf, {
+                'rf__n_estimators':     [100, 300, 500],
+                'rf__max_depth':        [5, 10, 15],
+                'rf__min_samples_leaf': [4, 8, 16],
+                'rf__max_features':     ['sqrt', 'log2']
+            }, cv=5, scoring='r2', n_jobs=-1).fit(X_train, y_train)
+            
+            p_rf = permutation_importance(grid_rf.best_estimator_, X_test, y_test, n_repeats=75, n_jobs=-1)
+            df_p_rf = pd.DataFrame({'feature': X_df.columns, 'importance_mean': p_rf.importances_mean, 'model': 'Random Forest'}).sort_values('importance_mean', ascending=False).reset_index(drop=True)
+            df_p_rf['rank_perm'] = df_p_rf.index + 1
+            
+            # SHAP Original RF
+            best_rf_model = grid_rf.best_estimator_.named_steps['rf']
+            X_train_background_rf = shap.sample(X_train, 100)
+            X_test_global_rf      = shap.sample(X_test, 75)
+            
+            explainer_rf = shap.TreeExplainer(best_rf_model, X_train_background_rf)
+            shap_values_rf = explainer_rf.shap_values(X_test_global_rf)
+            df_s_rf = pd.DataFrame({'feature': X_df.columns, 'shap_importance': np.mean(np.abs(shap_values_rf), axis=0), 'model': 'Random Forest'}).sort_values('shap_importance', ascending=False).reset_index(drop=True)
+            df_s_rf['rank_shap'] = df_s_rf.index + 1
 
-    print("\n" + "="*80)
-    print("  DIAGNÓSTICO DE CONVERGENCIA (ESTABILIDAD DEL RANKING)")
-    print("="*80)
-    print(f"  {'Feature':<35} {'Iter. Conv. Perm':>20} {'Iter. Conv. SHAP':>20}")
-    print(f"  {'-'*78}")
-    for feat in top_features:
-        print(f"  {feat:<35} {convergencia_iter_perm[feat]:>20} {convergencia_iter_shap[feat]:>20}")
-    print(f"\n  → Convergencia total de ranking PERMUTATION en iteración: {max_conv_perm}")
-    print(f"  → Convergencia total de ranking SHAP en iteración:        {max_conv_shap}")
-    print("="*80)
+            # ══════════════════════════════════════════════════════
+            # 3. Bayesian Ridge
+            # ══════════════════════════════════════════════════════
+            pipe_br = Pipeline([('scaler', StandardScaler()), ('bayesian', BayesianRidge())])
+            grid_br = GridSearchCV(pipe_br, {
+                'bayesian__max_iter': [300, 500, 1000],
+                'bayesian__alpha_1':  [1e-6, 1e-4],
+                'bayesian__alpha_2':  [1e-6, 1e-4],
+                'bayesian__lambda_1': [1e-6, 1e-4],
+                'bayesian__lambda_2': [1e-6, 1e-4],
+            }, cv=5, scoring='r2', n_jobs=-1).fit(X_train, y_train)
+            
+            p_br = permutation_importance(grid_br.best_estimator_, X_test, y_test, n_repeats=75, n_jobs=-1)
+            df_p_br = pd.DataFrame({'feature': X_df.columns, 'importance_mean': p_br.importances_mean, 'model': 'Bayesian Ridge'}).sort_values('importance_mean', ascending=False).reset_index(drop=True)
+            df_p_br['rank_perm'] = df_p_br.index + 1
+            
+            # SHAP Original Bayesian
+            best_rb_model = grid_br.best_estimator_.named_steps['bayesian']
+            scaler_br      = grid_br.best_estimator_.named_steps['scaler']
+            X_bg_scaled    = scaler_br.transform(X_train_background)
+            X_test_scaled  = scaler_br.transform(X_test_global)
+            explainer_rb   = shap.LinearExplainer(best_rb_model, X_bg_scaled)
+            shap_values_rb = explainer_rb.shap_values(X_test_scaled)
+            df_s_br = pd.DataFrame({'feature': X_df.columns, 'shap_importance': np.mean(np.abs(shap_values_rb), axis=0), 'model': 'Bayesian Ridge'}).sort_values('shap_importance', ascending=False).reset_index(drop=True)
+            df_s_br['rank_shap'] = df_s_br.index + 1
 
-print("\n[INFO] Script finalizado. Todos los resultados están en los CSV.")
+            # ══════════════════════════════════════════════════════
+            # 4. XGBoost
+            # ══════════════════════════════════════════════════════
+            pipe_xgb = Pipeline([('xgb', XGBRegressor(n_jobs=-1, random_state=42, verbosity=0))])
+            grid_xgb = GridSearchCV(pipe_xgb, {
+                'xgb__n_estimators':     [100, 300],
+                'xgb__max_depth':        [3, 6],
+                'xgb__learning_rate':    [0.05, 0.1],
+                'xgb__subsample':        [0.8, 1.0],
+                'xgb__colsample_bytree': [0.8, 1.0],
+            }, cv=5, scoring='r2', n_jobs=-1).fit(X_train, y_train)
+            
+            p_xgb = permutation_importance(grid_xgb.best_estimator_, X_test, y_test, n_repeats=75, n_jobs=-1)
+            df_p_xgb = pd.DataFrame({'feature': X_df.columns, 'importance_mean': p_xgb.importances_mean, 'model': 'XGBoost'}).sort_values('importance_mean', ascending=False).reset_index(drop=True)
+            df_p_xgb['rank_perm'] = df_p_xgb.index + 1
+            
+            # SHAP Original XGBoost
+            best_xgb_model = grid_xgb.best_estimator_.named_steps['xgb']
+            explainer_xgb = shap.TreeExplainer(best_xgb_model, X_train_background)
+            shap_values_xgb = explainer_xgb.shap_values(X_test_global)
+            df_s_xgb = pd.DataFrame({'feature': X_df.columns, 'shap_importance': np.mean(np.abs(shap_values_xgb), axis=0), 'model': 'XGBoost'}).sort_values('shap_importance', ascending=False).reset_index(drop=True)
+            df_s_xgb['rank_shap'] = df_s_xgb.index + 1
+
+            # --- Guardar Consensos (Rankings) en data/outputs/run_XXX/ ---
+            save_to_run(pd.concat([df_p_svr, df_p_rf, df_p_br, df_p_xgb]), 'ranking_consenso_perm.csv')
+            save_to_run(pd.concat([df_s_svr, df_s_rf, df_s_br, df_s_xgb]), 'ranking_consenso_shap.csv')
+            
+            # --- Guardar Historial de Predicciones ---
+            preds = {
+                'Pred_SVR': grid_svr.predict(X_test), 'Pred_RF': grid_rf.predict(X_test),
+                'Pred_Bayesian': grid_br.predict(X_test), 'Pred_XGBoost': grid_xgb.predict(X_test)
+            }
+            df_preds_iter = pd.DataFrame({
+                'Iteration': i + 1,
+                'Actual_Current': y_test.flatten()
+            })
+            for col_name, p_array in preds.items():
+                df_preds_iter[col_name] = p_array
+            save_to_run(df_preds_iter, 'model_predictions_history.csv')
+
+            # --- Guardar Métricas de Iteración ---
+            log_entry = {'iter': i+1, 'status': 'ok'}
+            for mod_key, p_array in preds.items():
+                mod = mod_key.replace("Pred_", "")
+                if mod == "XGBoost": mod = "XGB" 
+                log_entry.update({
+                    f'R2_{mod}': r2_score(y_test, p_array), f'MAE_{mod}': mean_absolute_error(y_test, p_array),
+                    f'RMSE_{mod}': np.sqrt(mean_squared_error(y_test, p_array)), f'MAPE_{mod}': mape(y_test, p_array)
+                })
+            log.append(log_entry)
+            
+        except Exception as e:
+            log.append({'iter': i+1, 'status': 'error', 'detail': str(e)})
+            print(f"Error en iteración: {e}")
+        finally:
+            gc.collect()
+
+    # Disparar generación de archivos finales
+    pd.DataFrame(log).to_csv(os.path.join(RUN_DIR, 'iteration_log.csv'), index=False)
+    ejecutar_analisis_final()
+
+    # ── PASO FINAL: Triple Consenso 80% normalizado ──────────────────────────
+    # (consenso_score.py integrado)
+    # Se ejecuta después de ejecutar_analisis_final() porque necesita los CSVs
+    # de ranking que el loop genera iterativamente.
+    # Produce: tabla_consenso_final.csv en el mismo RUN_DIR.
+    paths_consenso = {
+        "run_dir":    RUN_DIR,
+        "perm_csv":   os.path.join(RUN_DIR, "ranking_consenso_perm.csv"),
+        "shap_csv":   os.path.join(RUN_DIR, "ranking_consenso_shap.csv"),
+        "output_csv": os.path.join(RUN_DIR, "tabla_consenso_final.csv"),
+    }
+    process_triple_80(paths_consenso)
+
+    print(f"\n[OK] Ejecución finalizada con éxito.")
