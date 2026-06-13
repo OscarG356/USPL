@@ -3,12 +3,14 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 
 # 1. Cargar los datos
-df = pd.read_csv('/home/oagr/Documentos/Gita/USPL/data/data_USPL_2/outputs/run_20260505_183625/model_predictions_history.csv')
+df = pd.read_csv('/home/oagr/Documentos/Gita/USPL/data/data_USPL_2/outputs/run_20260520_143917/model_predictions_history.csv')
 
 # --- CONFIGURACIÓN DE FILTROS ---
 # Cambia estos valores para ajustar la resolución del eje Y
-MIN_CURRENT = float(input("Ingrese el valor mínimo de corriente para visualizar (ej. 0): "))
-MAX_CURRENT = float(input("Ingrese el valor máximo de corriente para visualizar (ej. 400): "))
+#MIN_Current = float(input("Ingrese el valor mínimo de corriente para visualizar (ej. 0): "))
+#MAX_Current = float(input("Ingrese el valor máximo de corriente para visualizar (ej. 400): "))
+MIN_Current = 17.0
+MAX_Current = 30.0    
 # --------------------------------
 
 def visualizar_predicciones(data, min_c, max_c):
@@ -25,7 +27,7 @@ def visualizar_predicciones(data, min_c, max_c):
     )
 
     # 4. Configuración de la estética
-    plt.figure(figsize=(12, 6))
+    plt.figure(figsize=(8, 4))
     sns.set_style("whitegrid")
 
     # 5. Graficar con Intervalo de Confianza (CI 95%)
@@ -42,15 +44,45 @@ def visualizar_predicciones(data, min_c, max_c):
     # 6. Plot the "Ideal" reference line (Actual vs Actual)
     plt.plot(filtered_df['Actual_Current'], filtered_df['Actual_Current'], 
              color='black', linestyle='--', label='Actual (Ideal)', linewidth=1)
+    plt.xlim(min_c, max_c)
+    plt.ylim(min_c, max_c)
 
     # Personalización
-    plt.title(f'Model Comparison (Range: {min_c} - {max_c} Current)', fontsize=14)
-    plt.xlabel('Actual Current', fontsize=12)
-    plt.ylabel('Prediction', fontsize=12)
-    plt.legend(title='Models / Reference', bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
-    
+    #plt.title(f'Model Comparison (Range: {min_c} - {max_c} Current)', fontsize=14)
+    # Aumentamos fontsize (ej. de 12 a 14) y añadimos weight='bold'
+    plt.xlabel('Actual Gain', fontsize=14, weight='bold')
+    plt.ylabel('Prediction', fontsize=14, weight='bold')
+
+    plt.tick_params(axis='both', labelsize=12)
+
+    # Para la leyenda, usamos prop para el texto y title_fontsize para el título
+    plt.legend(
+        title='Models / Reference', 
+        loc='lower right', 
+        prop={'size': 12, 'weight': 'bold'},  # Texto de la leyenda en negrita y tamaño 12
+        title_fontsize=13                     # Título de la leyenda un poco más grande
+    )
+
+    # Ponemos el título de la leyenda en negrita (opcional, requiere una línea extra)
+    plt.gca().get_legend().get_title().set_weight('bold')
+
+    plt.tight_layout()    
+    # Preguntar si guardar en PDF
+    #save_pdf = input("¿Desea guardar la gráfica en PDF? (s/n): ").strip().lower()
+    save_pdf = 's'  # Cambia a 's' para guardar automáticamente sin preguntar
+    if save_pdf == 's':
+        default_name = "grafica_prediccion.pdf"
+        #out_path = input(f"Nombre de archivo de salida (ej. {default_name}): ").strip()
+        out_path = ""  # Cambia a "" para usar el nombre por defecto sin preguntar
+        if out_path == "":
+            out_path = default_name
+        try:
+            plt.savefig(out_path, format='pdf', bbox_inches='tight')
+            print(f"Gráfica guardada en: {out_path}")
+        except Exception as e:
+            print(f"No se pudo guardar el archivo PDF: {e}")
+
     plt.show()
 
 # Ejecutar la función
-visualizar_predicciones(df, MIN_CURRENT, MAX_CURRENT)
+visualizar_predicciones(df, MIN_Current, MAX_Current)

@@ -2,8 +2,6 @@
 __pycache__/
 *.pyc
 
-data/raw/
-data/processed/
-data/outputs/
+data/
 
-reports/figures/
+reports/
