@@ -1,5 +1,6 @@
 import pandas as pd
 import seaborn as sns
+# pyrefly: ignore [missing-import]
 import matplotlib.pyplot as plt
 
 # 1. Cargar los datos
@@ -25,6 +26,12 @@ def visualizar_predicciones(data, min_c, max_c):
         var_name='Model', 
         value_name='Prediction'
     )
+    df_melted['Model'] = df_melted['Model'].replace({
+        'Pred_SVR': 'SVR',
+        'Pred_RF': 'RFR',
+        'Pred_Bayesian': 'BR',
+        'Pred_XGBoost': 'XGBoost'
+    })
 
     # 4. Configuración de la estética
     plt.figure(figsize=(8, 4))
@@ -50,8 +57,8 @@ def visualizar_predicciones(data, min_c, max_c):
     # Personalización
     #plt.title(f'Model Comparison (Range: {min_c} - {max_c} Current)', fontsize=14)
     # Aumentamos fontsize (ej. de 12 a 14) y añadimos weight='bold'
-    plt.xlabel('Actual Gain', fontsize=14, weight='bold')
-    plt.ylabel('Prediction', fontsize=14, weight='bold')
+    plt.xlabel('Actual $G_{\mathrm{EDFA}}$ (dB)', fontsize=14, weight='bold')
+    plt.ylabel('Predicted $G_{\mathrm{EDFA}}$ (dB)', fontsize=14, weight='bold')
 
     plt.tick_params(axis='both', labelsize=12)
 

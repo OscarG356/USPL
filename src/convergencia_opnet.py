@@ -3,8 +3,10 @@ import argparse
 
 import numpy as np
 import pandas as pd
+# pyrefly: ignore [missing-import]
 import matplotlib
 matplotlib.use('Agg')
+# pyrefly: ignore [missing-import]
 import matplotlib.pyplot as plt
 
 
@@ -75,7 +77,6 @@ def save_convergence_plot(df: pd.DataFrame, rank_col: str, imp_col: str, plot_ti
     conv_list = []
     for n in range(1, df_r['iteration'].max() + 1):
         sub = df_r[df_r['iteration'] <= n].groupby('feature').agg({rank_col: 'mean', imp_col: 'mean'}).reset_index()
-        sub['rank_abs'] = sub[rank_col].rank(method='min')
         sub['iteration'] = n
         conv_list.append(sub)
 
@@ -83,28 +84,27 @@ def save_convergence_plot(df: pd.DataFrame, rank_col: str, imp_col: str, plot_ti
     feats = df_plot['feature'].unique()
     colors = plt.cm.tab20(np.linspace(0, 1, len(feats)))
 
-    fig, axes = plt.subplots(2, 2, figsize=(18, 12))
-    fig.suptitle(f'Dual Convergence: {plot_title}', fontsize=16, fontweight='bold')
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
 
     for f_name, color in zip(feats, colors):
         d = df_plot[df_plot['feature'] == f_name].sort_values('iteration')
-        axes[0, 0].plot(d['iteration'], d['rank_abs'], color=color, linewidth=2, label=f_name)
-        axes[0, 1].plot(d['iteration'], d['rank_abs'].diff().abs(), color=color, linewidth=1.5)
-        axes[1, 0].plot(d['iteration'], d[imp_col], color=color, linewidth=2)
-        axes[1, 1].plot(d['iteration'], d[imp_col].diff().abs(), color=color, linewidth=1.5)
+        axes[0].plot(d['iteration'], d[imp_col], color=color, linewidth=2)
+        axes[1].plot(d['iteration'], d[imp_col].diff().abs(), color=color, linewidth=1.5)
 
-    axes[0, 0].set_title('Stability: Ranking Position')
-    axes[0, 0].invert_yaxis()
-    axes[0, 0].grid(alpha=0.3)
-    axes[0, 1].set_title('Rate of Change (Ranking)')
-    axes[0, 1].grid(alpha=0.3)
-    axes[1, 0].set_title('Stability: Importance Magnitude')
-    axes[1, 0].grid(alpha=0.3)
-    axes[1, 1].set_title('Rate of Change (Value)')
-    axes[1, 1].grid(alpha=0.3)
+    axes[0].set_title('Stability: Importance Magnitude', fontsize=14)
+    axes[0].set_xlabel('Iteration', fontsize=14)
+    axes[0].set_ylabel('Importance Value', fontsize=14)
+    axes[0].tick_params(axis='both', labelsize=14)
+    axes[0].grid(alpha=0.3)
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig(output_path, dpi=100)
+    axes[1].set_title('Rate of Change (Magnitude)', fontsize=14)
+    axes[1].set_xlabel('Iteration', fontsize=14)
+    axes[1].set_ylabel('|Δ Importance Value|', fontsize=14)
+    axes[1].tick_params(axis='both', labelsize=14)
+    axes[1].grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_path, format='pdf', bbox_inches='tight')
     plt.close(fig)
 
 
@@ -154,14 +154,14 @@ def calcular_convergencia(paths: dict) -> tuple[pd.DataFrame, dict]:
         'rank_perm',
         'importance_mean',
         'Permutation',
-        os.path.join(paths['reports_dir'], 'convergence_permutation.png')
+        os.path.join(paths['reports_dir'], 'convergence_permutation.pdf')
     )
     save_convergence_plot(
         df_shap,
         'rank_shap',
         'shap_importance',
         'SHAP',
-        os.path.join(paths['reports_dir'], 'convergence_shap.png')
+        os.path.join(paths['reports_dir'], 'convergence_shap.pdf')
     )
     
     # Calcular velocidad de convergencia

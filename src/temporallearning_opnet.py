@@ -8,19 +8,24 @@ import os
 import datetime
 import numpy as np
 import pandas as pd
+# pyrefly: ignore [missing-import]
 import matplotlib
 matplotlib.use('Agg')
+# pyrefly: ignore [missing-import]
 import matplotlib.pyplot as plt
+# pyrefly: ignore [missing-import]
 import matplotlib.cm as cm
 import seaborn as sns
+# pyrefly: ignore [missing-import]
 import shap
 import argparse
-from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.model_selection import GroupShuffleSplit, GridSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import BayesianRidge
+# pyrefly: ignore [missing-import]
 from xgboost import XGBRegressor
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from sklearn.inspection import permutation_importance
@@ -93,6 +98,25 @@ def save_to_run(df, filename):
         pd.concat([df_old, df], ignore_index=True).to_csv(path, index=False)
     else:
         df.to_csv(path, index=False)
+
+
+def split_por_corriente(X, y, test_size=0.2, random_state=None):
+    """
+    Divide en train/test agrupando por valor de corriente objetivo.
+    Garantiza que un mismo valor de corriente no aparezca en ambos conjuntos.
+    """
+    groups = np.asarray(y)
+    if np.unique(groups).size < 2:
+        raise ValueError("Se requieren al menos 2 valores de corriente distintos para hacer split.")
+
+    splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+    train_idx, test_idx = next(splitter.split(X, y, groups=groups))
+
+    overlap = np.intersect1d(np.unique(groups[train_idx]), np.unique(groups[test_idx]))
+    if overlap.size > 0:
+        raise RuntimeError("El split por corriente falló: hay corrientes compartidas entre train y test.")
+
+    return train_idx, test_idx
 
 
 # ══════════════════════════════════════════════════════════════
@@ -508,7 +532,14 @@ if __name__ == "__main__":
     for i in range(TOTAL_ITERACIONES): 
         print(f"[ITER {i+1}/{TOTAL_ITERACIONES}] Procesando modelos...")
         try:
-            X_train, X_test, y_train, y_test = train_test_split(X_df.values, y, test_size=0.2, stratify=pd.cut(y, bins=10))
+            train_idx, test_idx = split_por_corriente(
+                X_df.values,
+                y,
+                test_size=0.2,
+                random_state=i
+            )
+            X_train, X_test = X_df.values[train_idx], X_df.values[test_idx]
+            y_train, y_test = y[train_idx], y[test_idx]
             
             # --- Variables Globales de SHAP (Restauradas de tu código original) ---
             X_train_background = shap.sample(X_train, 100)
