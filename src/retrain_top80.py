@@ -1,6 +1,0 @@
-        fname_pdf = os.path.join(figures_dir, f"comparison_{file_key}_top80.pdf")
-        fname_png = os.path.join(figures_dir, f"comparison_{file_key}_top80.png")
-        plt.savefig(fname_pdf, format='pdf', bbox_inches='tight')
-        plt.savefig(fname_png, dpi=120, bbox_inches='tight')
-        plt.close()
-        print(f"[REPORTE] Gráfica guardada: {fname_pdf}")

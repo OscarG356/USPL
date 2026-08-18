@@ -1,0 +1,98 @@
+# -*- coding: utf-8 -*-
+"""
+Script para generar gráficas de convergencia globales del ranking de importancia 
+de TODAS las características, promediando los modelos y sin etiquetas.
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# =====================================================================
+# CONFIGURACIÓN MANUAL (Modifica la ruta según tu carpeta actual)
+# =====================================================================
+RUN_DIR = "/home/oagr/Documentos/Gita/USPL/data/data_USPL_2/outputs/run_20260812_150838_integrated"
+# =====================================================================
+
+def plot_global_feature_convergence(run_dir, method):
+    """
+    Grafica la convergencia global de todas las features.
+    method: 'shap' o 'perm'
+    """
+    if method.lower() == 'shap':
+        file_name = 'ranking_consenso_shap.csv'
+        rank_col = 'rank_shap'
+    else:
+        file_name = 'ranking_consenso_perm.csv'
+        rank_col = 'rank_perm'
+        
+    csv_path = os.path.join(run_dir, file_name)
+    
+    if not os.path.exists(csv_path):
+        print(f"[ERROR] Archivo no encontrado: {csv_path}")
+        return
+
+    print(f"Generando convergencia global para {method.upper()}...")
+    df = pd.read_csv(csv_path)
+    
+    # 1. Calcular el rango global por repetición (promediando los 4 modelos)
+    df_global = df.groupby(['repetition', 'feature'])[rank_col].mean().reset_index()
+    
+    max_rep = df['repetition'].max()
+    all_reps = np.arange(1, max_rep + 1)
+    all_features = df['feature'].unique()
+    
+    # Penalización si una feature es descartada en la selección de una iteración específica
+    penalty_rank = df[rank_col].max() + 1
+    
+    sns.set_theme(style="whitegrid")
+    plt.figure(figsize=(10, 7))
+    
+    # 2. Pre-calcular las medias acumuladas de todas para poder colorearlas
+    features_cum_ranks = {}
+    for feature in all_features:
+        df_feat = df_global[df_global['feature'] == feature].set_index('repetition')
+        df_feat = df_feat.reindex(all_reps).fillna(penalty_rank)
+        cum_mean = df_feat[rank_col].expanding().mean()
+        features_cum_ranks[feature] = cum_mean
+        
+    # Ordenar las features por su rango final para asignar un gradiente de color suave
+    sorted_features = sorted(all_features, key=lambda f: features_cum_ranks[f].iloc[-1])
+    colors = plt.cm.viridis(np.linspace(0, 0.8, len(sorted_features))) # Gradiente de color
+    
+    # 3. Graficar todas las líneas
+    for c_idx, feature in enumerate(sorted_features):
+        cum_mean_rank = features_cum_ranks[feature]
+        # Usamos líneas finas y transparentes para evitar saturación visual
+        plt.plot(all_reps, cum_mean_rank, color=colors[c_idx], linewidth=1.2, alpha=0.5)
+        
+    plt.title(f'Global Feature Rank Convergence - {method.upper()}', fontsize=16, fontweight='bold')
+    plt.xlabel('Number of Iterations', fontsize=14)
+    plt.ylabel('Cumulative Average Rank (Global Consensus)', fontsize=14)
+    
+    # Invertir el eje Y para que el Rango 1 (el más importante) esté en la parte superior
+    plt.gca().invert_yaxis()
+    
+    plt.tight_layout()
+    
+    output_pdf = os.path.join(run_dir, f'global_feature_convergence_{method}.pdf')
+    output_png = os.path.join(run_dir, f'global_feature_convergence_{method}.png')
+    
+    plt.savefig(output_pdf, bbox_inches='tight')
+    plt.savefig(output_png, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"[OK] Guardado en: {output_pdf}")
+
+if __name__ == "__main__":
+    if not os.path.exists(RUN_DIR):
+        print(f"[ERROR] La carpeta especificada no existe: {RUN_DIR}")
+        print("Por favor, actualiza la variable RUN_DIR en el código.")
+    else:
+        print(f"--- Iniciando análisis de convergencia en: {RUN_DIR} ---")
+        plot_global_feature_convergence(RUN_DIR, method='shap')
+        print("-" * 50)
+        plot_global_feature_convergence(RUN_DIR, method='perm')
+        print("--- Proceso finalizado ---")

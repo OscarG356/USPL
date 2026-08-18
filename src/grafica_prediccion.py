@@ -4,14 +4,14 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 
 # 1. Cargar los datos
-df = pd.read_csv('/home/oagr/Documentos/Gita/USPL/data/data_USPL_2/outputs/run_20260520_143917/model_predictions_history.csv')
+df = pd.read_csv('/home/oagr/Documentos/Gita/USPL/data/data_USPL_2/outputs/run_20260812_221005_integrated/model_predictions_history.csv')
 
 # --- CONFIGURACIÓN DE FILTROS ---
 # Cambia estos valores para ajustar la resolución del eje Y
 #MIN_Current = float(input("Ingrese el valor mínimo de corriente para visualizar (ej. 0): "))
 #MAX_Current = float(input("Ingrese el valor máximo de corriente para visualizar (ej. 400): "))
-MIN_Current = 17.0
-MAX_Current = 30.0    
+MIN_Current = 160.0
+MAX_Current = 400.0    
 # --------------------------------
 
 def visualizar_predicciones(data, min_c, max_c):
@@ -21,15 +21,15 @@ def visualizar_predicciones(data, min_c, max_c):
     # 3. Reestructurar datos (Melt) para que Seaborn pueda graficar varios modelos a la vez
     # Pasamos de formato ancho a formato largo
     df_melted = filtered_df.melt(
-        id_vars=['Iteration', 'Actual_Current'], 
-        value_vars=['Pred_SVR', 'Pred_RF', 'Pred_Bayesian', 'Pred_XGBoost'],
+        id_vars=['repetition', 'Actual_Current'], 
+        value_vars=['Pred_SVR', 'Pred_Random Forest', 'Pred_Bayesian Ridge', 'Pred_XGBoost'],
         var_name='Model', 
         value_name='Prediction'
     )
     df_melted['Model'] = df_melted['Model'].replace({
         'Pred_SVR': 'SVR',
-        'Pred_RF': 'RFR',
-        'Pred_Bayesian': 'BR',
+        'Pred_Random Forest': 'RFR',
+        'Pred_Bayesian Ridge': 'BR',
         'Pred_XGBoost': 'XGBoost'
     })
 
@@ -57,8 +57,8 @@ def visualizar_predicciones(data, min_c, max_c):
     # Personalización
     #plt.title(f'Model Comparison (Range: {min_c} - {max_c} Current)', fontsize=14)
     # Aumentamos fontsize (ej. de 12 a 14) y añadimos weight='bold'
-    plt.xlabel('Actual $G_{\mathrm{EDFA}}$ (dB)', fontsize=14, weight='bold')
-    plt.ylabel('Predicted $G_{\mathrm{EDFA}}$ (dB)', fontsize=14, weight='bold')
+    plt.xlabel('Actual $I_p$ (mA)', fontsize=14, weight='bold')
+    plt.ylabel('Predicted $G_p$ (mA)', fontsize=14, weight='bold')
 
     plt.tick_params(axis='both', labelsize=12)
 
