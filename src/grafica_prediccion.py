@@ -1,10 +1,10 @@
-import pandas as pd
-import seaborn as sns
 # pyrefly: ignore [missing-import]
 import matplotlib.pyplot as plt
+import pandas as pd
+import seaborn as sns
 
 # 1. Cargar los datos
-df = pd.read_csv('/home/oagr/Documentos/Gita/USPL/data/data_USPL_2/outputs/run_20260812_221005_integrated/model_predictions_history.csv')
+df = pd.read_csv('/home/oagr/Documentos/Gita/USPL/data/data_USPL_2/outputs/run_20260818_113505_loco_chunks/model_predictions_history.csv')
 
 # --- CONFIGURACIÓN DE FILTROS ---
 # Cambia estos valores para ajustar la resolución del eje Y
@@ -39,7 +39,7 @@ def visualizar_predicciones(data, min_c, max_c):
 
     # 5. Graficar con Intervalo de Confianza (CI 95%)
     # Seaborn calcula el CI automáticamente si hay múltiples valores para un mismo punto X
-    plot = sns.lineplot(
+    sns.lineplot(
         data=df_melted, 
         x='Actual_Current', 
         y='Prediction', 
@@ -86,7 +86,7 @@ def visualizar_predicciones(data, min_c, max_c):
         try:
             plt.savefig(out_path, format='pdf', bbox_inches='tight')
             print(f"Gráfica guardada en: {out_path}")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"No se pudo guardar el archivo PDF: {e}")
 
     plt.show()

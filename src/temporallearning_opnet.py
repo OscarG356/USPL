@@ -1,7 +1,7 @@
 """
 Pipeline Experimental Unificado y Leakage-Safe para Señales USPL
+Esquema Leave-One-Current-Range-Out (5 chunks deterministas de corriente).
 Incluye interpretabilidad (SHAP/Permutation) y reportes completos.
-Preparado para evaluación definitiva (100 iteraciones).
 """
 
 import argparse
@@ -37,7 +37,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.inspection import permutation_importance
 from sklearn.linear_model import BayesianRidge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import GridSearchCV, GroupKFold, GroupShuffleSplit
+from sklearn.model_selection import GridSearchCV, GroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
@@ -49,10 +49,17 @@ from xgboost import XGBRegressor
 # 1. CONFIGURACIÓN
 # ══════════════════════════════════════════════════════════════
 
-parser = argparse.ArgumentParser(description="Pipeline Integrado OPNET")
+parser = argparse.ArgumentParser(description="Pipeline Integrado OPNET - LOCO (Leave-One-Current-Range-Out)")
 parser.add_argument("--uspl", type=int, default=1, help="ID del láser (1 o 2)")
 parser.add_argument(
-    "--iters", type=int, default=5, help="Número de repeticiones del experimento"
+    "--iters",
+    type=int,
+    default=5,
+    help=(
+        "DEPRECADO / NO USADO para el split externo. El pipeline siempre ejecuta "
+        "exactamente 5 iteraciones deterministas (una por cada chunk de corriente). "
+        "Se conserva solo por compatibilidad de CLI."
+    ),
 )
 parser.add_argument(
     "--feature_method",
@@ -68,19 +75,32 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
+if args.iters != 5:
+    print(
+        f"[AVISO] --iters={args.iters} fue ignorado: el esquema Leave-One-Current-"
+        f"Range-Out ejecuta siempre exactamente 5 iteraciones (una por chunk)."
+    )
+
 USPL_ID = f"USPL_{args.uspl}"
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 TIMESTAMP = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")  # noqa: DTZ005
 
 RAW_DIR = os.path.join(BASE_DIR, "data", f"data_{USPL_ID}", "raw", "osciloscopio")
 RUN_DIR = os.path.join(
-    BASE_DIR, "data", f"data_{USPL_ID}", "outputs", f"run_{TIMESTAMP}_integrated"
+    BASE_DIR, "data", f"data_{USPL_ID}", "outputs", f"run_{TIMESTAMP}_loco_chunks"
 )
 os.makedirs(RUN_DIR, exist_ok=True)
 
-print(f"--- Iniciando Pipeline Unificado para: {USPL_ID} ---")
+print(f"--- Iniciando Pipeline LOCO (Leave-One-Current-Range-Out) para: {USPL_ID} ---")
 print(f"--- Salidas en: {RUN_DIR} ---")
 
+# ══════════════════════════════════════════════════════════════
+# 1bis. CHUNKS DE CORRIENTE (rangos deterministas)
+# ══════════════════════════════════════════════════════════════
+
+# Rango [min, max] (mA) inclusivo para cada chunk.
+N_CHUNKS = 5
+N_ITERS = args.iters
 # ══════════════════════════════════════════════════════════════
 # 2. FUNCIONES AUXILIARES Y PREPROCESAMIENTO RAW
 # ══════════════════════════════════════════════════════════════
@@ -94,7 +114,13 @@ def natural_sort_key(s: str) -> list:
 
 
 def load_raw_signals(data_folder: str):
-    """Carga y segmenta las señales CRUDAS. Sin normalizar."""
+    """Carga y segmenta las señales CRUDAS. Sin normalizar.
+
+    El `current_chunk` y el `trace_id` se asignan a la TRAZA ORIGINAL antes de
+    segmentar, y cada segmento generado hereda el mismo `current_chunk` y
+    `trace_id` que su traza de origen. Esto garantiza que nunca se mezclen
+    segmentos de una misma traza (o del mismo chunk) entre TRAIN y TEST.
+    """
     signal_files = [
         f
         for f in os.listdir(data_folder)
@@ -119,18 +145,40 @@ def load_raw_signals(data_folder: str):
     labels_df = pd.read_excel(os.path.join(data_folder, "Datos-Corriente.xlsx"))
     t_Corriente_raw = labels_df["Corriente (mA)"].values[191:]
 
-    # Segmentación
-    segmented_signals, segmented_labels = [], []
+    # Segmentación (con asignación de current_chunk y trace_id ANTES de segmentar)
+    num_traces = len(signals_matrix)
+    #np.random.seed(42)  # Opcional: fija una semilla para reproducibilidad
+    
+    # Genera un vector con la misma cantidad de elementos para cada chunk (1 a 5)
+    chunk_assignment = np.tile(np.arange(1, N_CHUNKS + 1), int(np.ceil(num_traces / N_CHUNKS)))[:num_traces]
+    np.random.shuffle(chunk_assignment)
+
+    segmented_signals = []
+    segmented_labels = []
+    segmented_chunks = []
+    segmented_trace_ids = []
     segment_length, num_segments = 300, 2
+
     for idx, signal_array in enumerate(signals_matrix):
+        current_value = float(t_Corriente_raw[idx])
+        chunk_id = int(chunk_assignment[idx])  # Chunk asignado aleatoriamente a la traza
+
         if len(signal_array) >= num_segments * segment_length:
             for i in range(num_segments):
                 segmented_signals.append(
                     signal_array[i * segment_length : (i + 1) * segment_length]
                 )
-                segmented_labels.append(t_Corriente_raw[idx])
+                segmented_labels.append(current_value)
+                segmented_chunks.append(chunk_id)
+                segmented_trace_ids.append(idx)
 
-    return np.array(segmented_signals), np.array(segmented_labels), fs
+    return (
+        np.array(segmented_signals),
+        np.array(segmented_labels),
+        np.array(segmented_chunks),
+        np.array(segmented_trace_ids),
+        fs,
+    )
 
 
 def mape(y_true, y_pred):
@@ -242,43 +290,88 @@ def process_triple_80(paths: dict) -> None:
 
 
 # ══════════════════════════════════════════════════════════════
-# 3. PIPELINE PRINCIPAL (LOOP)
+# 3. PIPELINE PRINCIPAL (LOOP LOCO: 5 iteraciones deterministas)
 # ══════════════════════════════════════════════════════════════
 
 
 def run_pipeline():
-    X_raw, y_raw, fs = load_raw_signals(RAW_DIR)
+    X_raw, y_raw, _chunk_raw_dummy, trace_id_raw, fs = load_raw_signals(RAW_DIR)
     domain = args.feature_method
     if domain == "all":
         domain = None
     cfg = tsfel.get_features_by_domain(domain)
 
     metrics_log, residuals_log, split_log = [], [], []
+    N_ITERS = args.iters
 
-    for iteration in range(args.iters):
+    for iteration in range(N_ITERS):
         repetition = iteration + 1
-        print(f"\n{'=' * 50}\nIteration {repetition}/{args.iters}\n{'=' * 50}")
+        
+        # 1. Asignar chunks aleatorios por traza en CADA iteración
+        unique_traces = np.unique(trace_id_raw)
+        num_traces = len(unique_traces)
+        
+        np.random.seed(42 + repetition)  # Semilla variable por iteración
+        
+        chunks_array = np.tile(np.arange(1, N_CHUNKS + 1), int(np.ceil(num_traces / N_CHUNKS)))[:num_traces]
+        np.random.shuffle(chunks_array)
+        trace_to_chunk = dict(zip(unique_traces, chunks_array))
+        
+        chunk_raw = np.array([trace_to_chunk[t_id] for t_id in trace_id_raw])
+        
+        # 2. Selección de Chunk de Test
+        test_chunk = (repetition % N_CHUNKS) + 1
+        train_chunks = [c for c in range(1, N_CHUNKS + 1) if c != test_chunk]
 
-        # --- SPLIT CONSCIENTE DE GRUPOS ---
-        splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=iteration)
-        train_idx, test_idx = next(splitter.split(X_raw, y_raw, groups=y_raw))
-        X_train_raw, X_test_raw = X_raw[train_idx], X_raw[test_idx]
-        y_train, y_test = y_raw[train_idx], y_raw[test_idx]
+        # 3. Máscaras y Split (ÚNICA VEZ)
+        train_mask = np.isin(chunk_raw, train_chunks)
+        test_mask = chunk_raw == test_chunk
 
-        train_groups = np.unique(y_train)
-        test_groups = np.unique(y_test)
-        assert len(set(train_groups) & set(test_groups)) == 0, (
-            "ERROR FATAL: Leakage en Split"
+        X_train_raw, X_test_raw = X_raw[train_mask], X_raw[test_mask]
+        y_train, y_test = y_raw[train_mask], y_raw[test_mask]
+        chunk_train, chunk_test = chunk_raw[train_mask], chunk_raw[test_mask]
+        trace_id_train, trace_id_test = (
+            trace_id_raw[train_mask],
+            trace_id_raw[test_mask],
+        )
+        
+        test_min, test_max = float(y_test.min()), float(y_test.max())
+
+        print(f"\n{'=' * 50}")
+        print(f"Iteration {repetition}/{N_ITERS}")
+        print(f"TEST CHUNK (Random Split): {test_chunk}")
+        print(f"TEST RANGE: {test_min:.2f}–{test_max:.2f} mA")
+        print(f"TRAIN CHUNKS: {train_chunks}")
+        print(f"{'=' * 50}")
+
+        # --- VALIDACIONES METODOLÓGICAS ---
+        assert len(set(np.unique(chunk_train)) & set(np.unique(chunk_test))) == 0, (
+            "ERROR FATAL: Leakage en Split de Chunks (chunk presente en TRAIN y TEST)"
+        )
+        assert set(np.unique(chunk_train)) == set(train_chunks), (
+            "ERROR FATAL: TRAIN no contiene exactamente los 4 chunks esperados"
+        )
+        assert set(np.unique(chunk_test)) == {test_chunk}, (
+            "ERROR FATAL: TEST no corresponde exactamente al chunk esperado"
+        )
+        assert len(set(trace_id_train) & set(trace_id_test)) == 0, (
+            "ERROR FATAL: Leakage de trazas entre TRAIN y TEST"
         )
 
         split_log.append(
             {
                 "repetition": repetition,
-                "random_seed": iteration,
-                "train_groups": train_groups.tolist(),
-                "test_groups": test_groups.tolist(),
+                "test_chunk": test_chunk,
+                "test_current_min": test_min,
+                "test_current_max": test_max,
+                "train_chunks": ",".join(map(str, train_chunks)),
+                "train_current_min": float(y_train.min()),
+                "train_current_max": float(y_train.max()),
+                "n_train_samples": len(y_train),
+                "n_test_samples": len(y_test),
             }
         )
+        # ... Resto del pipeline de entrenamiento TSFEL / Modelos / SHAP ...
 
         # --- NORMALIZACIÓN (Solo TRAIN) ---
         X_min_train = np.min(X_train_raw)
@@ -348,7 +441,8 @@ def run_pipeline():
             shap.sample(X_test_sel, 75) if len(X_test_sel) > 75 else X_test_sel
         )
 
-        inner_cv = GroupKFold(n_splits=5)
+        # CV interno: 4 chunks en TRAIN -> GroupKFold(n_splits=4), agrupado por chunk
+        inner_cv = GroupKFold(n_splits=4)
 
         for model_name, (estimator, param_grid) in models.items():
             pipe = Pipeline([("scaler", StandardScaler()), ("model", estimator)])
@@ -359,7 +453,7 @@ def run_pipeline():
                 scoring="neg_mean_absolute_error",
                 n_jobs=-1,
             )
-            grid.fit(X_train_sel, y_train, groups=y_train)
+            grid.fit(X_train_sel, y_train, groups=chunk_train)
 
             y_pred = grid.predict(X_test_sel)
             iter_preds[f"Pred_{model_name}"] = y_pred
@@ -380,6 +474,7 @@ def run_pipeline():
             )
             df_p["rank_perm"] = df_p.index + 1
             df_p["repetition"] = repetition
+            df_p["test_chunk"] = test_chunk
             df_p_list.append(df_p)
 
             # SHAP
@@ -415,12 +510,17 @@ def run_pipeline():
             )
             df_s["rank_shap"] = df_s.index + 1
             df_s["repetition"] = repetition
+            df_s["test_chunk"] = test_chunk
             df_s_list.append(df_s)
 
             # Métricas
             metrics_log.append(
                 {
                     "repetition": repetition,
+                    "test_chunk": test_chunk,
+                    "test_current_min": test_min,
+                    "test_current_max": test_max,
+                    "train_chunks": ",".join(map(str, train_chunks)),
                     "model": model_name,
                     "R2": r2_score(y_test, y_pred),
                     "MAE": mean_absolute_error(y_test, y_pred),
@@ -439,6 +539,7 @@ def run_pipeline():
                 residuals_log.append(
                     {
                         "repetition": repetition,
+                        "test_chunk": test_chunk,
                         "model": model_name,
                         "setpoint": y_t,
                         "y_true": y_t,
@@ -458,7 +559,7 @@ def run_pipeline():
     # 4. ANÁLISIS FINAL Y GUARDADO ESTADÍSTICO
     # ══════════════════════════════════════════════════════════════
 
-    # Save Split Info
+    # Save Split Info (auditable: qué chunk fue TEST, rangos, tamaños de muestra)
     pd.DataFrame(split_log).to_csv(
         os.path.join(RUN_DIR, "splits_info.csv"), index=False
     )
@@ -469,7 +570,7 @@ def run_pipeline():
     df_residuals = pd.DataFrame(residuals_log)
     df_residuals.to_csv(os.path.join(RUN_DIR, "residuals.csv"), index=False)
 
-    # Resumen y CI (Bootstrap simple para la MEDIA)
+    # Resumen y CI (Bootstrap simple para la MEDIA) sobre las 5 iteraciones/chunks
     summary_list = []
     np.random.seed(42)  # Reproducibilidad del bootstrap
     n_boot = 1000
@@ -495,13 +596,14 @@ def run_pipeline():
                     "Median": median_val,
                     "CI95_lower": ci_lower,
                     "CI95_upper": ci_upper,
+                    "n_iterations": len(data),
                 }
             )
     pd.DataFrame(summary_list).to_csv(
         os.path.join(RUN_DIR, "confidence_intervals.csv"), index=False
     )
 
-    # Comparación Pareada (Wilcoxon) con Corrección Holm
+    # Comparación Pareada (Wilcoxon) con Corrección Holm, sobre las 5 iteraciones/chunks
     comparisons = []
     model_names = list(models.keys())
 
@@ -587,7 +689,7 @@ def run_pipeline():
     }
     process_triple_80(paths_consenso)
 
-    print("\n[OK] Pipeline finalizado metodológicamente correcto.")
+    print("\n[OK] Pipeline LOCO (Leave-One-Current-Range-Out) finalizado metodológicamente correcto.")
 
 
 if __name__ == "__main__":
