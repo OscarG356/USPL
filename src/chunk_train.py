@@ -1,13 +1,20 @@
 """
-Pipeline Experimental Unificado y Leakage-Safe para Señales USPL
-Esquema Leave-One-Current-Range-Out (5 chunks deterministas de corriente).
-Incluye interpretabilidad (SHAP/Permutation) y reportes completos.
+Machine learning pipeline for pump current estimation using TSFEL features.
+
+The pipeline trains four regression models:
+*   - Support Vector Regression (SVR)
+*   - Random Forest
+*   - Bayesian Ridge
+*   - XGBoost
+
+SHAP and permutation importance are used to identify and compare
+the most important features for each model.
 """
 
 import argparse
 import datetime
 
-#import gc
+# import gc
 import os
 import re
 
@@ -19,11 +26,11 @@ import pandas as pd
 matplotlib.use("Agg")
 # pyrefly: ignore [missing-import]
 # pyrefly: ignore [missing-import]
-#import matplotlib.cm as cm
-#import matplotlib.pyplot as plt
+# import matplotlib.cm as cm
+# import matplotlib.pyplot as plt
 
 # pyrefly: ignore [missing-import]
-#import seaborn as sns
+# import seaborn as sns
 
 # pyrefly: ignore [missing-import]
 import shap
@@ -45,65 +52,76 @@ from sklearn.svm import SVR
 # pyrefly: ignore [missing-import]
 from xgboost import XGBRegressor
 
-# ══════════════════════════════════════════════════════════════
-# 1. CONFIGURACIÓN
-# ══════════════════════════════════════════════════════════════
+# --------------------------------------------------------------
+# 1. Configuration
+# --------------------------------------------------------------
 
-parser = argparse.ArgumentParser(description="Pipeline Integrado OPNET - LOCO (Leave-One-Current-Range-Out)")
-parser.add_argument("--uspl", type=int, default=1, help="ID del láser (1 o 2)")
+parser = argparse.ArgumentParser(
+    description="USPL Pump Current Estimation Pipeline - Random Chunk"
+)
+
+parser.add_argument(
+    "--uspl",
+    type=int,
+    default=1,
+    help="Laser ID (1 or 2)",
+)
+
 parser.add_argument(
     "--iters",
     type=int,
     default=5,
-    help=(
-        "DEPRECADO / NO USADO para el split externo. El pipeline siempre ejecuta "
-        "exactamente 5 iteraciones deterministas (una por cada chunk de corriente). "
-        "Se conserva solo por compatibilidad de CLI."
-    ),
+    help="Number of iterations to run",
 )
+
 parser.add_argument(
     "--feature_method",
     type=str,
     default="all",
-    help="Selección de características (temporal o all)",
+    help="Feature domain to use: temporal, statistical, spectral, or all",
 )
+
 parser.add_argument(
     "--threshold_corr",
     type=float,
     default=0.90,
-    help="Umbral de correlación para descartar características",
+    help="Correlation threshold for feature elimination",
 )
-args = parser.parse_args()
 
-if args.iters != 5:
-    print(
-        f"[AVISO] --iters={args.iters} fue ignorado: el esquema Leave-One-Current-"
-        f"Range-Out ejecuta siempre exactamente 5 iteraciones (una por chunk)."
-    )
+
+parser.add_argument(
+    "--operation_regime",
+    type=str,
+    default="mode-locking",
+    help="Operating regime to train: mode-locking or supercontinuum",
+)
+
+args = parser.parse_args()
 
 USPL_ID = f"USPL_{args.uspl}"
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 TIMESTAMP = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")  # noqa: DTZ005
 
-RAW_DIR = os.path.join(BASE_DIR, "data", f"data_{USPL_ID}", "raw", "osciloscopio")
+RAW_DIR = os.path.join(BASE_DIR, "data", f"data_{USPL_ID}", "raw", args.feature_method,"temporal")
 RUN_DIR = os.path.join(
-    BASE_DIR, "data", f"data_{USPL_ID}", "outputs", f"run_{TIMESTAMP}_loco_chunks"
+    BASE_DIR,
+    "data",
+    f"data_{USPL_ID}",
+    "outputs",
+    args.feature_method,
+    f"run_{TIMESTAMP}",
 )
 os.makedirs(RUN_DIR, exist_ok=True)
 
-print(f"--- Iniciando Pipeline LOCO (Leave-One-Current-Range-Out) para: {USPL_ID} ---")
-print(f"--- Salidas en: {RUN_DIR} ---")
+print(f"--- Starting Random Chunk Pipeline for: {USPL_ID} ---")
+print(f"--- Outputs: {RUN_DIR} ---")
 
-# ══════════════════════════════════════════════════════════════
-# 1bis. CHUNKS DE CORRIENTE (rangos deterministas)
-# ══════════════════════════════════════════════════════════════
 
-# Rango [min, max] (mA) inclusivo para cada chunk.
-N_CHUNKS = 5
-N_ITERS = args.iters
-# ══════════════════════════════════════════════════════════════
-# 2. FUNCIONES AUXILIARES Y PREPROCESAMIENTO RAW
-# ══════════════════════════════════════════════════════════════
+N_CHUNKS = 5  # For 80%-20% split
+
+# --------------------------------------------------------------
+# 2. Raw Data Preprocessing
+# --------------------------------------------------------------
 
 
 def natural_sort_key(s: str) -> list:
@@ -113,13 +131,11 @@ def natural_sort_key(s: str) -> list:
     ]
 
 
-def load_raw_signals(data_folder: str):
-    """Carga y segmenta las señales CRUDAS. Sin normalizar.
+def load_raw_signals(data_folder: str, regime: str):
+    """
+    Load and cut RAW signals
 
-    El `current_chunk` y el `trace_id` se asignan a la TRAZA ORIGINAL antes de
-    segmentar, y cada segmento generado hereda el mismo `current_chunk` y
-    `trace_id` que su traza de origen. Esto garantiza que nunca se mezclen
-    segmentos de una misma traza (o del mismo chunk) entre TRAIN y TEST.
+    * current_chunk and trace_id are heredated by the segmented signal
     """
     signal_files = [
         f
@@ -134,41 +150,50 @@ def load_raw_signals(data_folder: str):
         signal_df = pd.read_csv(file_path, header=0)
         all_signals_data.append(signal_df.iloc[:, 1].astype(float))
 
-    all_signals_data = all_signals_data[191:]
     signals_matrix = pd.DataFrame(all_signals_data).values
 
-    # Obtener fs
+    # Get fs
     example_df = pd.read_csv(os.path.join(data_folder, signal_files[0]), header=0)
     fs = 1 / (example_df.iloc[1, 0] - example_df.iloc[0, 0])
 
-    # Etiquetas
+    # Labels
     labels_df = pd.read_excel(os.path.join(data_folder, "Datos-Corriente.xlsx"))
-    t_Corriente_raw = labels_df["Corriente (mA)"].values[191:]
+    if regime == "mode-locking":
+        target_raw = labels_df["Corriente (mA)"].values[:]
+    else:
+        target_raw = labels_df["Ganancia-EDFA (dBm)"].values[:]
 
-    # Segmentación (con asignación de current_chunk y trace_id ANTES de segmentar)
+    # Segmentation
     num_traces = len(signals_matrix)
-    #np.random.seed(42)  # Opcional: fija una semilla para reproducibilidad
-    
-    # Genera un vector con la misma cantidad de elementos para cada chunk (1 a 5)
-    chunk_assignment = np.tile(np.arange(1, N_CHUNKS + 1), int(np.ceil(num_traces / N_CHUNKS)))[:num_traces]
+
+    if regime == "mode-locking":
+        segment_length = 200
+        num_segments = 3
+    else:
+        segment_length = signals_matrix.shape[1]
+        num_segments = 1
+
+    # Chunk division
+    chunk_assignment = np.tile(
+        np.arange(1, N_CHUNKS + 1), int(np.ceil(num_traces / N_CHUNKS))
+    )[:num_traces]
     np.random.shuffle(chunk_assignment)
 
     segmented_signals = []
     segmented_labels = []
     segmented_chunks = []
     segmented_trace_ids = []
-    segment_length, num_segments = 300, 2
 
     for idx, signal_array in enumerate(signals_matrix):
-        current_value = float(t_Corriente_raw[idx])
-        chunk_id = int(chunk_assignment[idx])  # Chunk asignado aleatoriamente a la traza
+        target_value = float(target_raw[idx])
+        chunk_id = int(chunk_assignment[idx])
 
         if len(signal_array) >= num_segments * segment_length:
             for i in range(num_segments):
                 segmented_signals.append(
                     signal_array[i * segment_length : (i + 1) * segment_length]
                 )
-                segmented_labels.append(current_value)
+                segmented_labels.append(target_value)
                 segmented_chunks.append(chunk_id)
                 segmented_trace_ids.append(idx)
 
@@ -182,18 +207,17 @@ def load_raw_signals(data_folder: str):
 
 
 def mape(y_true, y_pred):
-    y_true_safe = np.where(y_true == 0, 1e-10, y_true)
-    return np.mean(np.abs((y_true_safe - y_pred) / y_true_safe)) * 100
+    return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
 
 
 def fit_feature_selection(X_train_df, threshold_corr=0.90, epsilon=1e-10):
-    """Determina qué características mantener usando ÚNICAMENTE TRAIN."""
-    # 1. Varianza
+    """Select features using variance and correlation filtering."""
+    # 1. Variance
     variances = X_train_df.var()
     keep_var = variances[variances > epsilon].index.tolist()
     X_train_var = X_train_df[keep_var]
 
-    # 2. Correlación
+    # 2. Correlation
     corr_matrix = X_train_var.corr().abs()
     upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
     to_drop_corr = [c for c in upper.columns if any(upper[c] >= threshold_corr)]
@@ -211,7 +235,7 @@ def save_to_run_append(df, filename):
 
 
 def holm_correction(pvals):
-    """Aplica la corrección paso a paso de Holm-Bonferroni para comparaciones múltiples."""
+    """Apply the Holm-Bonferroni correction for multiple comparisons."""
     pvals = np.array(pvals)
     n = len(pvals)
     sorted_indices = np.argsort(pvals)
@@ -229,13 +253,13 @@ def holm_correction(pvals):
 
 
 def process_triple_80(paths: dict) -> None:
-    """Calcula el consenso Triple 80% sobre importancias de Permutation y SHAP."""
+    """Calculate feature importance consensus using permutation importance, SHAP."""
     print(
-        f"\n--- Calculando Triple Consenso 80% en: {os.path.basename(paths['run_dir'])} ---"
+        f"\n--- Calculating Triple 80% Consensus in: {os.path.basename(paths['run_dir'])} ---"
     )
 
     if not os.path.exists(paths["perm_csv"]) or not os.path.exists(paths["shap_csv"]):
-        print("[ERROR] Faltan archivos base para consenso_score.")
+        print("[ERROR] Required files for consensus calculation are missing.")
         return
 
     df_p = pd.read_csv(paths["perm_csv"])
@@ -289,13 +313,13 @@ def process_triple_80(paths: dict) -> None:
     print(f"[OK] Consensus table generated at: {paths['output_csv']}")
 
 
-# ══════════════════════════════════════════════════════════════
-# 3. PIPELINE PRINCIPAL (LOOP LOCO: 5 iteraciones deterministas)
-# ══════════════════════════════════════════════════════════════
+# --------------------------------------------------------------
+# 3. Main pipeline
+# --------------------------------------------------------------
 
 
 def run_pipeline():
-    X_raw, y_raw, _chunk_raw_dummy, trace_id_raw, fs = load_raw_signals(RAW_DIR)
+    X_raw, y_raw, _chunk_raw_dummy, trace_id_raw, fs = load_raw_signals(RAW_DIR,args.operation_regime)
     domain = args.feature_method
     if domain == "all":
         domain = None
@@ -306,24 +330,27 @@ def run_pipeline():
 
     for iteration in range(N_ITERS):
         repetition = iteration + 1
-        
-        # 1. Asignar chunks aleatorios por traza en CADA iteración
+
+        # 1. Random Chunk Assignment
         unique_traces = np.unique(trace_id_raw)
         num_traces = len(unique_traces)
-        
-        np.random.seed(42 + repetition)  # Semilla variable por iteración
-        
-        chunks_array = np.tile(np.arange(1, N_CHUNKS + 1), int(np.ceil(num_traces / N_CHUNKS)))[:num_traces]
+
+        # Random assignment without a fixed seed
+        # // np.random.seed(42 + repetition)
+
+        chunks_array = np.tile(
+            np.arange(1, N_CHUNKS + 1), int(np.ceil(num_traces / N_CHUNKS))
+        )[:num_traces]
         np.random.shuffle(chunks_array)
         trace_to_chunk = dict(zip(unique_traces, chunks_array))
-        
+
         chunk_raw = np.array([trace_to_chunk[t_id] for t_id in trace_id_raw])
-        
-        # 2. Selección de Chunk de Test
+
+        # 2. Test Chunk Selection
         test_chunk = (repetition % N_CHUNKS) + 1
         train_chunks = [c for c in range(1, N_CHUNKS + 1) if c != test_chunk]
 
-        # 3. Máscaras y Split (ÚNICA VEZ)
+        # 3. Train/Test Split
         train_mask = np.isin(chunk_raw, train_chunks)
         test_mask = chunk_raw == test_chunk
 
@@ -334,28 +361,31 @@ def run_pipeline():
             trace_id_raw[train_mask],
             trace_id_raw[test_mask],
         )
-        
+
         test_min, test_max = float(y_test.min()), float(y_test.max())
 
         print(f"\n{'=' * 50}")
         print(f"Iteration {repetition}/{N_ITERS}")
-        print(f"TEST CHUNK (Random Split): {test_chunk}")
+        print(f"TEST CHUNK: {test_chunk}")
         print(f"TEST RANGE: {test_min:.2f}–{test_max:.2f} mA")
         print(f"TRAIN CHUNKS: {train_chunks}")
         print(f"{'=' * 50}")
 
-        # --- VALIDACIONES METODOLÓGICAS ---
+        # --- Leakage Checks ---
         assert len(set(np.unique(chunk_train)) & set(np.unique(chunk_test))) == 0, (
-            "ERROR FATAL: Leakage en Split de Chunks (chunk presente en TRAIN y TEST)"
+            "FATAL ERROR: Chunk leakage detected between TRAIN and TEST."
         )
+
         assert set(np.unique(chunk_train)) == set(train_chunks), (
-            "ERROR FATAL: TRAIN no contiene exactamente los 4 chunks esperados"
+            "FATAL ERROR: TRAIN does not contain exactly the expected chunks."
         )
+
         assert set(np.unique(chunk_test)) == {test_chunk}, (
-            "ERROR FATAL: TEST no corresponde exactamente al chunk esperado"
+            "FATAL ERROR: TEST does not correspond exactly to the expected chunk."
         )
+
         assert len(set(trace_id_train) & set(trace_id_test)) == 0, (
-            "ERROR FATAL: Leakage de trazas entre TRAIN y TEST"
+            "FATAL ERROR: Trace leakage detected between TRAIN and TEST."
         )
 
         split_log.append(
@@ -371,9 +401,8 @@ def run_pipeline():
                 "n_test_samples": len(y_test),
             }
         )
-        # ... Resto del pipeline de entrenamiento TSFEL / Modelos / SHAP ...
 
-        # --- NORMALIZACIÓN (Solo TRAIN) ---
+        # --- Train-Based Signal Normalization ---
         X_min_train = np.min(X_train_raw)
         X_max_train = np.max(X_train_raw)
 
@@ -406,7 +435,7 @@ def run_pipeline():
         common_cols = X_train_feat.columns.intersection(X_test_feat.columns)
         X_train_feat, X_test_feat = X_train_feat[common_cols], X_test_feat[common_cols]
 
-        # --- FEATURE SELECTION (Solo TRAIN) ---
+        # --- FEATURE SELECTION (TRAIN) ---
         selected_features = fit_feature_selection(
             X_train_feat, threshold_corr=args.threshold_corr
         )
@@ -417,7 +446,7 @@ def run_pipeline():
 
         print(f"Features: {X_train_feat.shape[1]} -> {len(selected_features)} selected")
 
-        # --- MODELADO, SHAP Y PERMUTATION ---
+        # --- Model Training and Explainability ---
         models = {
             "SVR": (SVR(), {"model__C": [10, 100], "model__gamma": ["scale", 0.01]}),
             "Random Forest": (
@@ -441,7 +470,6 @@ def run_pipeline():
             shap.sample(X_test_sel, 75) if len(X_test_sel) > 75 else X_test_sel
         )
 
-        # CV interno: 4 chunks en TRAIN -> GroupKFold(n_splits=4), agrupado por chunk
         inner_cv = GroupKFold(n_splits=4)
 
         for model_name, (estimator, param_grid) in models.items():
@@ -460,7 +488,7 @@ def run_pipeline():
 
             # Permutation Importance
             p_imp = permutation_importance(
-                grid.best_estimator_, X_test_sel, y_test, n_repeats=30, n_jobs=-1
+                grid.best_estimator_, X_test_sel, y_test, n_repeats=75, n_jobs=-1
             )
             df_p = pd.DataFrame(
                 {
@@ -513,7 +541,7 @@ def run_pipeline():
             df_s["test_chunk"] = test_chunk
             df_s_list.append(df_s)
 
-            # Métricas
+            # Metrics
             metrics_log.append(
                 {
                     "repetition": repetition,
@@ -550,16 +578,16 @@ def run_pipeline():
                     }
                 )
 
-        # --- GUARDAR ARCHIVOS DE INTERPRETABILIDAD POR ITERACIÓN ---
+        # --- Save files ---
         save_to_run_append(pd.concat(df_p_list), "ranking_consenso_perm.csv")
         save_to_run_append(pd.concat(df_s_list), "ranking_consenso_shap.csv")
         save_to_run_append(pd.DataFrame(iter_preds), "model_predictions_history.csv")
 
-    # ══════════════════════════════════════════════════════════════
-    # 4. ANÁLISIS FINAL Y GUARDADO ESTADÍSTICO
-    # ══════════════════════════════════════════════════════════════
+    # --------------------------------------------------------------
+    # 4. Final Statistical Analysis
+    # --------------------------------------------------------------
 
-    # Save Split Info (auditable: qué chunk fue TEST, rangos, tamaños de muestra)
+    # Save Split Info
     pd.DataFrame(split_log).to_csv(
         os.path.join(RUN_DIR, "splits_info.csv"), index=False
     )
@@ -570,9 +598,9 @@ def run_pipeline():
     df_residuals = pd.DataFrame(residuals_log)
     df_residuals.to_csv(os.path.join(RUN_DIR, "residuals.csv"), index=False)
 
-    # Resumen y CI (Bootstrap simple para la MEDIA) sobre las 5 iteraciones/chunks
+    # Sumary
     summary_list = []
-    np.random.seed(42)  # Reproducibilidad del bootstrap
+    # //np.random.seed(42)
     n_boot = 1000
     for model in df_metrics["model"].unique():
         for metric in ["R2", "MAE", "RMSE", "MAPE"]:
@@ -603,7 +631,7 @@ def run_pipeline():
         os.path.join(RUN_DIR, "confidence_intervals.csv"), index=False
     )
 
-    # Comparación Pareada (Wilcoxon) con Corrección Holm, sobre las 5 iteraciones/chunks
+    # Comparision between models
     comparisons = []
     model_names = list(models.keys())
 
@@ -614,7 +642,6 @@ def run_pipeline():
             for j in range(i + 1, len(model_names)):
                 modA, modB = model_names[i], model_names[j]
 
-                # Asegurar alineación por repetición para datos puramente pareados
                 dataA = (
                     df_metrics[df_metrics["model"] == modA]
                     .sort_values("repetition")[metric]
@@ -634,7 +661,6 @@ def run_pipeline():
                 # Wilcoxon signed-rank test
                 _stat, p_val = wilcoxon(dataA, dataB)
 
-                # Tamaño de efecto (Cohen's dz)
                 effect_size = mean_diff / std_diff if std_diff != 0 else 0
 
                 metric_comps_temp.append(
@@ -650,7 +676,7 @@ def run_pipeline():
                 )
                 metric_pvals.append(p_val)
 
-        # Corrección de Holm
+        # Holm corrections
         adj_pvals = holm_correction(metric_pvals)
         for k in range(len(metric_comps_temp)):
             metric_comps_temp[k]["adjusted_p_value"] = adj_pvals[k]
@@ -660,7 +686,7 @@ def run_pipeline():
         os.path.join(RUN_DIR, "paired_model_comparison.csv"), index=False
     )
 
-    # Resumen de residuales por Setpoint y Modelo
+    # Residual summary
     def rmse_agg(x):
         return np.sqrt(np.mean(x**2))
 
@@ -680,7 +706,7 @@ def run_pipeline():
     )
     residual_summary.to_csv(os.path.join(RUN_DIR, "residual_summary.csv"), index=False)
 
-    # Generar el Consenso 80% Final
+    # Generate final concensum
     paths_consenso = {
         "run_dir": RUN_DIR,
         "perm_csv": os.path.join(RUN_DIR, "ranking_consenso_perm.csv"),
@@ -689,7 +715,7 @@ def run_pipeline():
     }
     process_triple_80(paths_consenso)
 
-    print("\n[OK] Pipeline LOCO (Leave-One-Current-Range-Out) finalizado metodológicamente correcto.")
+    print("\n[OK] Pipeline finish.")
 
 
 if __name__ == "__main__":
