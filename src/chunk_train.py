@@ -102,7 +102,9 @@ USPL_ID = f"USPL_{args.uspl}"
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 TIMESTAMP = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")  # noqa: DTZ005
 
-RAW_DIR = os.path.join(BASE_DIR, "data", f"data_{USPL_ID}", "raw", args.feature_method,"temporal")
+RAW_DIR = os.path.join(
+    BASE_DIR, "data", f"data_{USPL_ID}", "raw", args.operation_regime, "temporal"
+)
 RUN_DIR = os.path.join(
     BASE_DIR,
     "data",
@@ -319,7 +321,9 @@ def process_triple_80(paths: dict) -> None:
 
 
 def run_pipeline():
-    X_raw, y_raw, _chunk_raw_dummy, trace_id_raw, fs = load_raw_signals(RAW_DIR,args.operation_regime)
+    X_raw, y_raw, _chunk_raw_dummy, trace_id_raw, fs = load_raw_signals(
+        RAW_DIR, args.operation_regime
+    )
     domain = args.feature_method
     if domain == "all":
         domain = None
@@ -618,9 +622,9 @@ def run_pipeline():
             summary_list.append(
                 {
                     "Model": model,
-                    "Metric": metric,
                     "Mean": mean_val,
                     "Std": std_val,
+                    "Metric": metric,
                     "Median": median_val,
                     "CI95_lower": ci_lower,
                     "CI95_upper": ci_upper,
