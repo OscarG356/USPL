@@ -150,7 +150,8 @@ def load_raw_signals(data_folder: str, regime: str):
     for file_name in signal_files:
         file_path = os.path.join(data_folder, file_name)
         signal_df = pd.read_csv(file_path, header=0)
-        all_signals_data.append(signal_df.iloc[:, 1].astype(float))
+        all_signals_data.append(signal_df["intensity"].astype(float))
+        #all_signals_data.append(signal_df.iloc[:, 1].astype(float))
 
     signals_matrix = pd.DataFrame(all_signals_data).values
 

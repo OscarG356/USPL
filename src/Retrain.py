@@ -1,70 +1,21 @@
 """
-Experimento Independiente: Entrenamiento con features Top-80% por modelo
-==========================================================================
+Experiment: Training models using the Top-80% most important features
 
-Este script es un EXPERIMENTO SEPARADO que reutiliza la metodología
-leakage-safe del pipeline original (`temporallearning_opnet.py`), pero
-en lugar de usar todas las features seleccionadas tras el filtrado de
-varianza/correlación, cada modelo se entrena usando ÚNICAMENTE el
-subconjunto de features que representa hasta el 80% de su importancia
-acumulada, según los rankings de interpretabilidad (Permutation + SHAP)
-generados previamente por el pipeline original.
+This script evaluates the impact of reducing the number of input features
+by training each model using only the subset of features that accounts for
+80% of the cumulative importance, based on previously computed SHAP and
+Permutation Importance rankings.
 
-NO modifica ni sobrescribe ningún archivo del pipeline original.
-NO recalcula SHAP ni Permutation Importance: los rankings ya existentes
-se cargan desde el directorio de salida (`--original_run_dir`) de una
-corrida previa del pipeline original.
+The script requires:
+1. 'tabla_consenso_final.csv' (optional, only if it contains a 'model' column).
+2. 'ranking_consenso_perm.csv' and 'ranking_consenso_shap.csv' as the
+   default sources for model-specific feature importance rankings.
+3. 'metrics_per_iteration.csv' (optional). If available, it is used to
+   compare the Top-80% results with the original experiment using all
+   features. If it is not available, only the Top-80% results are generated.
 
-────────────────────────────────────────────────────────────────────────
-¿Qué archivos del pipeline original utiliza este script?
-────────────────────────────────────────────────────────────────────────
-Del directorio `--original_run_dir` (RUN_DIR de una corrida previa de
-`temporallearning_opnet.py`) se leen, en este orden de prioridad:
-
-1. `tabla_consenso_final.csv`
-   - Si esta tabla contiene una columna `model`, se asume que ya trae el
-     consenso desagregado POR MODELO y se usa directamente para construir
-     el Top-80% de cada modelo.
-   - En el pipeline original tal como está escrito, `tabla_consenso_final.csv`
-     es un CONSENSO GLOBAL (promedia SHAP/Permutation sobre todas las
-     iteraciones y TODOS los modelos juntos, ver `process_triple_80`), por
-     lo que normalmente NO contiene la columna `model`. En ese caso este
-     script NO la usa como fuente del Top-80% por modelo (para no asumir
-     que un consenso global equivale al Top-80% de cada modelo individual).
-
-2. `ranking_consenso_perm.csv` y `ranking_consenso_shap.csv`
-   - Estos sí contienen la columna `model` (y `repetition`), por lo que son
-     la fuente utilizada por defecto. Este script:
-       a. Promedia `importance_mean` (Permutation) y `shap_importance`
-          (SHAP) por (modelo, feature) a través de todas las repeticiones
-          disponibles en esos archivos.
-       b. Normaliza esos promedios con min-max, POR MODELO (igual que
-          `process_triple_80` en el pipeline original, pero sin colapsar
-          los modelos entre sí).
-       c. Calcula `Consensus_General = mean(perm_norm, shap_norm)` por
-          (modelo, feature).
-       d. Para cada modelo, ordena descendentemente por `Consensus_General`,
-          calcula la importancia relativa acumulada y selecciona las
-          features hasta alcanzar el 80% acumulado, con el mismo criterio
-          exacto usado en el pipeline original:
-              Top80 = (cumsum_acumulado_previo < 0.80)
-          manteniendo siempre al menos la primera feature.
-
-Adicionalmente, si existe `metrics_per_iteration.csv` en el
-`--original_run_dir`, se utiliza (sin volver a entrenar nada) como fuente
-de la comparación "ALL FEATURES" contra la cual se compara el experimento
-Top-80% (sección 8 del encargo). Si no existe, el script genera únicamente
-los resultados Top-80% y deja preparada la estructura de comparación.
-
-────────────────────────────────────────────────────────────────────────
-Uso
-────────────────────────────────────────────────────────────────────────
-python top80_feature_experiment_opnet.py \
-    --uspl 1 \
-    --original_run_dir /ruta/a/data/data_USPL_1/outputs/run_XXXXXXXX_integrated \
-    --iters 5 \
-    --feature_method all \
-    --top80_threshold 0.80
+The original SHAP and Permutation Importance analyses are not recalculated.
+The rankings are loaded from a previous run of the original pipeline.
 """
 
 from __future__ import annotations
@@ -95,81 +46,63 @@ from sklearn.svm import SVR
 # pyrefly: ignore [missing-import]
 from xgboost import XGBRegressor
 
-# ══════════════════════════════════════════════════════════════
-# 1. CONFIGURACIÓN / CLI
-# ══════════════════════════════════════════════════════════════
+# --------------------------------------------------------------
+# 1. Configuration
+# --------------------------------------------------------------
 
 parser = argparse.ArgumentParser(
-    description=(
-        "Experimento independiente: entrenamiento con features Top-80% "
-        "por modelo (derivadas del análisis de interpretabilidad del "
-        "pipeline original)."
-    )
+    description=("Training models using the Top-80% most important features.")
 )
-parser.add_argument("--uspl", type=int, default=1, help="ID del láser (1 o 2)")
-parser.add_argument(
-    "--iters", type=int, default=5, help="Número de repeticiones del experimento"
-)
+parser.add_argument("--uspl", type=int, default=1, help="Laser ID (1 or 2)")
+parser.add_argument("--iters", type=int, default=5, help="Number of iterations to run.")
 parser.add_argument(
     "--feature_method",
     type=str,
     default="all",
-    help=(
-        "Dominio TSFEL usado para extraer features. DEBE coincidir con el "
-        "usado en la corrida original para que los nombres de features "
-        "sean comparables."
-    ),
+    help=("Feature domain to use: temporal, statistical, spectral, or all."),
 )
 parser.add_argument(
     "--threshold_corr",
     type=float,
     default=0.90,
-    help=(
-        "Umbral de correlación (informativo / heredado del pipeline "
-        "original). NO se reaplica un filtro de correlación sobre las "
-        "features Top-80%: éstas se tratan como una selección de "
-        "características ya determinada por el análisis de "
-        "interpretabilidad previo."
-    ),
+    help=("Correlation threshold for feature elimination."),
 )
 parser.add_argument(
     "--top80_threshold",
     type=float,
     default=0.80,
-    help="Umbral de importancia acumulada para definir el conjunto Top-N%.",
+    help="Threshold for cumulative importance Top-N%.",
 )
 parser.add_argument(
     "--original_run_dir",
     type=str,
     required=True,
-    help=(
-        "Directorio RUN_DIR de una corrida previa de "
-        "temporallearning_opnet.py. Debe contener ranking_consenso_perm.csv "
-        "y ranking_consenso_shap.csv (y opcionalmente tabla_consenso_final.csv "
-        "y metrics_per_iteration.csv)."
-    ),
+    help=("Path with the previus complete run."),
 )
 parser.add_argument(
-    "--raw_dir",
+    "--operation_regime",
     type=str,
-    default=None,
-    help=(
-        "Ruta explícita a la carpeta con las señales crudas del osciloscopio. "
-        "Si no se especifica, se infiere igual que en el pipeline original: "
-        "<BASE_DIR>/data/data_USPL_<uspl>/raw/osciloscopio"
-    ),
+    default="mode-locking",
+    help="Operating regime to train: mode-locking or supercontinuum",
 )
+
 args = parser.parse_args()
 
 USPL_ID = f"USPL_{args.uspl}"
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 TIMESTAMP = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")  # noqa: DTZ005
 
-RAW_DIR = args.raw_dir or os.path.join(
-    BASE_DIR, "data", f"data_{USPL_ID}", "raw", "osciloscopio"
+RAW_DIR = os.path.join(
+    BASE_DIR, "data", f"data_{USPL_ID}", "raw", args.operation_regime, "temporal"
 )
+
 RUN_DIR = os.path.join(
-    BASE_DIR, "data", f"data_{USPL_ID}", "outputs", f"run_{TIMESTAMP}_top80"
+    BASE_DIR,
+    "data",
+    f"data_{USPL_ID}",
+    "outputs",
+    args.feature_method,
+    f"run_{TIMESTAMP}_top80",
 )
 PLOTS_DIR = os.path.join(RUN_DIR, "plots")
 os.makedirs(RUN_DIR, exist_ok=True)
@@ -182,13 +115,13 @@ MODEL_NAME_TO_FILESAFE = {
     "XGBoost": "XGBoost",
 }
 
-print(f"--- Experimento Top-{args.top80_threshold:.0%} de features para: {USPL_ID} ---")
-print(f"--- Directorio original (rankings): {args.original_run_dir} ---")
-print(f"--- Salidas nuevas en: {RUN_DIR} ---")
+print(f"--- Top-{args.top80_threshold:.0%} Feature Experiment: {USPL_ID} ---")
+print(f"--- Original Run Directory: {args.original_run_dir} ---")
+print(f"--- New Output Directory: {RUN_DIR} ---")
 
-# ══════════════════════════════════════════════════════════════
+# --------------------------------------------------------------
 # 2. FUNCIONES AUXILIARES (idénticas al pipeline original donde aplica)
-# ══════════════════════════════════════════════════════════════
+# --------------------------------------------------------------
 
 
 def natural_sort_key(s: str) -> list:
@@ -249,9 +182,9 @@ def save_to_run_append(df: pd.DataFrame, filename: str) -> None:
         df.to_csv(path, index=False)
 
 
-# ══════════════════════════════════════════════════════════════
+# --------------------------------------------------------------
 # 3. CONSTRUCCIÓN DEL CONJUNTO TOP-N% POR MODELO
-# ══════════════════════════════════════════════════════════════
+# --------------------------------------------------------------
 
 
 def _normalize_per_model(df: pd.DataFrame, col: str) -> pd.DataFrame:
@@ -394,9 +327,9 @@ def get_top_n_percent_features(original_run_dir: str, threshold: float) -> pd.Da
     return df_top
 
 
-# ══════════════════════════════════════════════════════════════
+# --------------------------------------------------------------
 # 4. MODELOS (idénticos al pipeline original)
-# ══════════════════════════════════════════════════════════════
+# --------------------------------------------------------------
 
 
 def build_model_specs():
@@ -414,9 +347,9 @@ def build_model_specs():
     }
 
 
-# ══════════════════════════════════════════════════════════════
+# --------------------------------------------------------------
 # 5. PIPELINE PRINCIPAL
-# ══════════════════════════════════════════════════════════════
+# --------------------------------------------------------------
 
 
 def run_pipeline():
@@ -609,9 +542,9 @@ def run_pipeline():
 
         iter_pred_records.append(iter_preds)
 
-    # ══════════════════════════════════════════════════════════════
+    # --------------------------------------------------------------
     # 6. GUARDADO DE ARCHIVOS PRINCIPALES
-    # ══════════════════════════════════════════════════════════════
+    # --------------------------------------------------------------
 
     pd.DataFrame(split_log).to_csv(
         os.path.join(RUN_DIR, "splits_info.csv"), index=False
@@ -682,9 +615,9 @@ def run_pipeline():
         os.path.join(RUN_DIR, "residual_summary_top80.csv"), index=False
     )
 
-    # ══════════════════════════════════════════════════════════════
+    # --------------------------------------------------------------
     # 7. COMPARACIÓN ALL vs TOP-80% (si el experimento original está disponible)
-    # ══════════════════════════════════════════════════════════════
+    # --------------------------------------------------------------
 
     all_metrics_path = os.path.join(args.original_run_dir, "metrics_per_iteration.csv")
     comparison_rows = []
@@ -814,27 +747,27 @@ def run_pipeline():
     df_impact = pd.DataFrame(impact_rows)
     df_impact.to_csv(os.path.join(RUN_DIR, "feature_impact_analysis.csv"), index=False)
 
-    # ══════════════════════════════════════════════════════════════
+    # --------------------------------------------------------------
     # 8. GRÁFICAS
-    # ══════════════════════════════════════════════════════════════
+    # --------------------------------------------------------------
     generate_plots(df_metrics, df_residuals, df_comparison, all_available, model_names)
 
-    # ══════════════════════════════════════════════════════════════
+    # --------------------------------------------------------------
     # 9. RESUMEN FINAL POR CONSOLA
-    # ══════════════════════════════════════════════════════════════
+    # --------------------------------------------------------------
     print_final_summary(df_metrics, model_names)
 
     print(f"\n[OK] Experimento Top-{args.top80_threshold:.0%} finalizado.")
     print(f"[OK] Resultados guardados en: {RUN_DIR}")
 
 
-# ══════════════════════════════════════════════════════════════
+# --------------------------------------------------------------
 # 10. GRÁFICAS
-# ══════════════════════════════════════════════════════════════
+# --------------------------------------------------------------
 
 
 def generate_plots(df_metrics, df_residuals, df_comparison, all_available, model_names):
-    # A. Comparación de número de features (All vs Top80)
+    # A. Number of features comparison (All vs Top80)
     if all_available:
         pivot_n = df_comparison.pivot(
             index="Model", columns="Feature_Set", values="N_Features"
@@ -842,10 +775,8 @@ def generate_plots(df_metrics, df_residuals, df_comparison, all_available, model
         pivot_n = pivot_n.reindex(model_names)
         fig, ax = plt.subplots(figsize=(8, 5))
         pivot_n.plot(kind="bar", ax=ax)
-        ax.set_ylabel("Número de features")
-        ax.set_title(
-            f"Número de features: All vs Top-{args.top80_threshold:.0%}"
-        )
+        ax.set_ylabel("Number of features")
+        ax.set_title(f"Number of features: All vs Top-{args.top80_threshold:.0%}")
         plt.tight_layout()
         fig.savefig(os.path.join(PLOTS_DIR, "A_n_features_all_vs_top80.png"), dpi=150)
         plt.close(fig)
@@ -853,15 +784,13 @@ def generate_plots(df_metrics, df_residuals, df_comparison, all_available, model
         n_top80 = df_metrics.groupby("model")["n_features"].first().reindex(model_names)
         fig, ax = plt.subplots(figsize=(8, 5))
         n_top80.plot(kind="bar", ax=ax, color="steelblue")
-        ax.set_ylabel("Número de features")
-        ax.set_title(
-            f"Número de features Top-{args.top80_threshold:.0%} por modelo"
-        )
+        ax.set_ylabel("Number of features")
+        ax.set_title(f"Number of Top-{args.top80_threshold:.0%} features per model")
         plt.tight_layout()
         fig.savefig(os.path.join(PLOTS_DIR, "A_n_features_top80.png"), dpi=150)
         plt.close(fig)
 
-    # B. Comparación de rendimiento (R2, MAE, RMSE): All vs Top80
+    # B. Performance comparison (R2, MAE, RMSE): All vs Top80
     if all_available:
         for metric in ["R2", "MAE", "RMSE"]:
             pivot_m = df_comparison.pivot(
@@ -892,13 +821,13 @@ def generate_plots(df_metrics, df_residuals, df_comparison, all_available, model
                 color="darkorange",
             )
             ax.set_ylabel(metric)
-            ax.set_title(f"{metric} (Top-{args.top80_threshold:.0%}) por modelo")
+            ax.set_title(f"{metric} (Top-{args.top80_threshold:.0%}) per model")
             plt.xticks(rotation=20)
             plt.tight_layout()
             fig.savefig(os.path.join(PLOTS_DIR, f"B_{metric}_top80.png"), dpi=150)
             plt.close(fig)
 
-    # C. Predicción vs valor real (Top80), por modelo
+    # C. Predicted vs actual value (Top80), per model
     for model in model_names:
         sub = df_residuals[df_residuals["model"] == model]
         if sub.empty:
@@ -910,15 +839,15 @@ def generate_plots(df_metrics, df_residuals, df_comparison, all_available, model
             max(sub["y_true"].max(), sub["y_pred"].max()),
         ]
         ax.plot(lims, lims, "r--", linewidth=1)
-        ax.set_xlabel("Corriente real (mA)")
-        ax.set_ylabel("Corriente predicha (mA)")
+        ax.set_xlabel("Actual current (mA)")
+        ax.set_ylabel("Predicted current (mA)")
         safe_name = MODEL_NAME_TO_FILESAFE[model]
-        ax.set_title(f"{model} — Predicción vs Real (Top-{args.top80_threshold:.0%})")
+        ax.set_title(f"{model} — Predicted vs Actual (Top-{args.top80_threshold:.0%})")
         plt.tight_layout()
         fig.savefig(os.path.join(PLOTS_DIR, f"C_pred_vs_real_{safe_name}.png"), dpi=150)
         plt.close(fig)
 
-    # D. Error por corriente (setpoint)
+    # D. Error by current (setpoint)
     for model in model_names:
         sub = df_residuals[df_residuals["model"] == model]
         if sub.empty:
@@ -934,11 +863,11 @@ def generate_plots(df_metrics, df_residuals, df_comparison, all_available, model
         fig, ax = plt.subplots(figsize=(8, 5))
         ax.plot(grouped["setpoint"], grouped["MAE"], marker="o", label="MAE")
         ax.plot(grouped["setpoint"], grouped["RMSE"], marker="s", label="RMSE")
-        ax.set_xlabel("Setpoint de corriente (mA)")
+        ax.set_xlabel("Current setpoint (mA)")
         ax.set_ylabel("Error")
         safe_name = MODEL_NAME_TO_FILESAFE[model]
         ax.set_title(
-            f"{model} — Error por setpoint de corriente (Top-{args.top80_threshold:.0%})"
+            f"{model} — Error by current setpoint (Top-{args.top80_threshold:.0%})"
         )
         ax.legend()
         plt.tight_layout()
@@ -947,12 +876,12 @@ def generate_plots(df_metrics, df_residuals, df_comparison, all_available, model
         )
         plt.close(fig)
 
-    print(f"[OK] Gráficas guardadas en: {PLOTS_DIR}")
+    print(f"[OK] Plots saved to: {PLOTS_DIR}")
 
 
-# ══════════════════════════════════════════════════════════════
+# --------------------------------------------------------------
 # 11. RESUMEN FINAL POR CONSOLA
-# ══════════════════════════════════════════════════════════════
+# --------------------------------------------------------------
 
 
 def print_final_summary(df_metrics, model_names):
