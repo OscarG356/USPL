@@ -119,7 +119,8 @@ print(f"--- Starting Random Chunk Pipeline for: {USPL_ID} ---")
 print(f"--- Outputs: {RUN_DIR} ---")
 
 
-N_CHUNKS = 5  # For 80%-20% split
+N_CHUNKS = 10  # 10 contiguous chunks: 8 for TRAIN, 2 randomly selected for TEST (~80/20)
+N_TEST_CHUNKS = 2  # number of chunks randomly selected as TEST at each iteration
 
 # --------------------------------------------------------------
 # 2. Raw Data Preprocessing
@@ -146,11 +147,17 @@ def load_raw_signals(data_folder: str, regime: str):
     ]
     signal_files.sort(key=natural_sort_key)
 
+    if regime == 'mode-locking':
+        extractor = lambda df: df.iloc[:, 1].astype(float)
+    else:
+        extractor = lambda df: df["intensity"].astype(float)       
+
     all_signals_data = []
     for file_name in signal_files:
         file_path = os.path.join(data_folder, file_name)
         signal_df = pd.read_csv(file_path, header=0)
-        all_signals_data.append(signal_df["intensity"].astype(float))
+        all_signals_data.append(extractor(signal_df))
+        #all_signals_data.append(signal_df["intensity"].astype(float))
         #all_signals_data.append(signal_df.iloc[:, 1].astype(float))
 
     signals_matrix = pd.DataFrame(all_signals_data).values
@@ -176,11 +183,16 @@ def load_raw_signals(data_folder: str, regime: str):
         segment_length = signals_matrix.shape[1]
         num_segments = 1
 
-    # Chunk division
-    chunk_assignment = np.tile(
-        np.arange(1, N_CHUNKS + 1), int(np.ceil(num_traces / N_CHUNKS))
-    )[:num_traces]
-    np.random.shuffle(chunk_assignment)
+    # Chunk division: contiguous blocks in the original (physical/current) order.
+    # NOTE: this assignment is not used for the actual TRAIN/TEST split (that is
+    # recomputed in run_pipeline from trace_id, once, before the iteration loop).
+    # It is kept here only so the returned `segmented_chunks` array is consistent
+    # with the real contiguous-chunk scheme instead of a leftover random one.
+    chunk_assignment = np.zeros(num_traces, dtype=int)
+    for chunk_id, idx_block in enumerate(
+        np.array_split(np.arange(num_traces), N_CHUNKS), start=1
+    ):
+        chunk_assignment[idx_block] = chunk_id
 
     segmented_signals = []
     segmented_labels = []
@@ -207,6 +219,24 @@ def load_raw_signals(data_folder: str, regime: str):
         np.array(segmented_trace_ids),
         fs,
     )
+
+
+def create_contiguous_chunks(num_traces: int, n_chunks: int) -> np.ndarray:
+    """
+    Split `num_traces` traces (already in their original, physically-ordered
+    sequence) into `n_chunks` contiguous, approximately-equal-sized blocks.
+
+    Returns an array of length `num_traces` with the 1-indexed chunk id of
+    each trace (position i -> chunk assigned to trace i). No shuffling is
+    performed: trace i and trace i+1 are always in the same chunk unless
+    trace i is the last element of its block.
+    """
+    chunk_assignment = np.zeros(num_traces, dtype=int)
+    for chunk_id, idx_block in enumerate(
+        np.array_split(np.arange(num_traces), n_chunks), start=1
+    ):
+        chunk_assignment[idx_block] = chunk_id
+    return chunk_assignment
 
 
 def mape(y_true, y_pred):
@@ -326,38 +356,71 @@ def run_pipeline():
         RAW_DIR, args.operation_regime
     )
     domain = args.feature_method
+
     if domain == "all":
-        domain = None
-    cfg = tsfel.get_features_by_domain(domain)
+        cfg = tsfel.get_features_by_domain(domain=None)
+    else:
+        selected_domains = [d.strip() for d in domain.split(',') if d.strip()]
+        
+        # Validación rápida
+        valid_domains = {'temporal', 'statistical', 'spectral', 'fractal'}
+        for d in selected_domains:
+            if d not in valid_domains:
+                raise ValueError(f"Dominio '{d}' no válido. Usa: {valid_domains}")
+        
+        # ! IMPORTANTE: TSFEL solo acepta UN dominio, no una lista
+        if len(selected_domains) == 1:
+            cfg = tsfel.get_features_by_domain(domain=selected_domains[0])
+        else:
+            cfg = {}
+            for d in selected_domains:
+                cfg.update(tsfel.get_features_by_domain(domain=d))
 
     metrics_log, residuals_log, split_log = [], [], []
     N_ITERS = args.iters
 
+    # --------------------------------------------------------------
+    # Contiguous chunk assignment (Random Contiguous Chunk Split)
+    # --------------------------------------------------------------
+    # The chunks themselves are NOT random: they are N_CHUNKS consecutive
+    # blocks of traces following the original (physically-ordered) sequence
+    # of the dataset. This is computed only once, before the iteration loop,
+    # because the chunk boundaries never change across iterations - only the
+    # selection of which chunks act as TEST changes per iteration below.
+    unique_traces = np.unique(trace_id_raw)
+    num_traces = len(unique_traces)
+
+    chunks_array = create_contiguous_chunks(num_traces, N_CHUNKS)
+    trace_to_chunk = dict(zip(unique_traces, chunks_array))
+    chunk_raw = np.array([trace_to_chunk[t_id] for t_id in trace_id_raw])
+
+    # Sanity check: every chunk must be made of index-contiguous traces
+    # (i.e. no interleaving/shuffling was introduced while building chunks).
+    for chunk_id in range(1, N_CHUNKS + 1):
+        traces_in_chunk = np.sort(unique_traces[chunks_array == chunk_id])
+        if len(traces_in_chunk) > 1:
+            assert np.all(np.diff(traces_in_chunk) == 1), (
+                f"FATAL ERROR: Chunk {chunk_id} is not made of contiguous traces."
+            )
+
     for iteration in range(N_ITERS):
         repetition = iteration + 1
 
-        # 1. Random Chunk Assignment
-        unique_traces = np.unique(trace_id_raw)
-        num_traces = len(unique_traces)
+        # --- Random selection of TEST chunks (only source of randomness) ---
+        # A fresh, reproducible-but-different RNG per iteration: same
+        # `repetition` always yields the same selection, but different
+        # iterations yield different selections.
+        rng = np.random.default_rng(42 + repetition)
+        test_chunks = sorted(
+            rng.choice(
+                np.arange(1, N_CHUNKS + 1), size=N_TEST_CHUNKS, replace=False
+            ).tolist()
+        )
+        train_chunks = [c for c in range(1, N_CHUNKS + 1) if c not in test_chunks]
 
-        # Random assignment without a fixed seed
-        # // np.random.seed(42 + repetition)
-
-        chunks_array = np.tile(
-            np.arange(1, N_CHUNKS + 1), int(np.ceil(num_traces / N_CHUNKS))
-        )[:num_traces]
-        np.random.shuffle(chunks_array)
-        trace_to_chunk = dict(zip(unique_traces, chunks_array))
-
-        chunk_raw = np.array([trace_to_chunk[t_id] for t_id in trace_id_raw])
-
-        # 2. Test Chunk Selection
-        test_chunk = (repetition % N_CHUNKS) + 1
-        train_chunks = [c for c in range(1, N_CHUNKS + 1) if c != test_chunk]
-
-        # 3. Train/Test Split
+        # --- Train/Test Split ---
         train_mask = np.isin(chunk_raw, train_chunks)
-        test_mask = chunk_raw == test_chunk
+        test_mask = np.isin(chunk_raw, test_chunks)
 
         X_train_raw, X_test_raw = X_raw[train_mask], X_raw[test_mask]
         y_train, y_test = y_raw[train_mask], y_raw[test_mask]
@@ -371,13 +434,21 @@ def run_pipeline():
 
         print(f"\n{'=' * 50}")
         print(f"Iteration {repetition}/{N_ITERS}")
-        print(f"TEST CHUNK: {test_chunk}")
+        print(f"TEST CHUNKS: {test_chunks}")
         print(f"TEST RANGE: {test_min:.2f}–{test_max:.2f} mA")
         print(f"TRAIN CHUNKS: {train_chunks}")
         print(f"{'=' * 50}")
 
         # --- Leakage Checks ---
-        assert len(set(np.unique(chunk_train)) & set(np.unique(chunk_test))) == 0, (
+        assert len(test_chunks) == N_TEST_CHUNKS, (
+            "FATAL ERROR: TEST does not contain exactly the expected number of chunks."
+        )
+
+        assert len(train_chunks) == N_CHUNKS - N_TEST_CHUNKS, (
+            "FATAL ERROR: TRAIN does not contain exactly the expected number of chunks."
+        )
+
+        assert len(set(train_chunks) & set(test_chunks)) == 0, (
             "FATAL ERROR: Chunk leakage detected between TRAIN and TEST."
         )
 
@@ -385,8 +456,8 @@ def run_pipeline():
             "FATAL ERROR: TRAIN does not contain exactly the expected chunks."
         )
 
-        assert set(np.unique(chunk_test)) == {test_chunk}, (
-            "FATAL ERROR: TEST does not correspond exactly to the expected chunk."
+        assert set(np.unique(chunk_test)) == set(test_chunks), (
+            "FATAL ERROR: TEST does not correspond exactly to the expected chunks."
         )
 
         assert len(set(trace_id_train) & set(trace_id_test)) == 0, (
@@ -396,10 +467,10 @@ def run_pipeline():
         split_log.append(
             {
                 "repetition": repetition,
-                "test_chunk": test_chunk,
+                "test_chunks": ",".join(map(str, test_chunks)),
+                "train_chunks": ",".join(map(str, train_chunks)),
                 "test_current_min": test_min,
                 "test_current_max": test_max,
-                "train_chunks": ",".join(map(str, train_chunks)),
                 "train_current_min": float(y_train.min()),
                 "train_current_max": float(y_train.max()),
                 "n_train_samples": len(y_train),
@@ -507,7 +578,7 @@ def run_pipeline():
             )
             df_p["rank_perm"] = df_p.index + 1
             df_p["repetition"] = repetition
-            df_p["test_chunk"] = test_chunk
+            df_p["test_chunks"] = ",".join(map(str, test_chunks))
             df_p_list.append(df_p)
 
             # SHAP
@@ -543,14 +614,14 @@ def run_pipeline():
             )
             df_s["rank_shap"] = df_s.index + 1
             df_s["repetition"] = repetition
-            df_s["test_chunk"] = test_chunk
+            df_s["test_chunks"] = ",".join(map(str, test_chunks))
             df_s_list.append(df_s)
 
             # Metrics
             metrics_log.append(
                 {
                     "repetition": repetition,
-                    "test_chunk": test_chunk,
+                    "test_chunks": ",".join(map(str, test_chunks)),
                     "test_current_min": test_min,
                     "test_current_max": test_max,
                     "train_chunks": ",".join(map(str, train_chunks)),
@@ -572,7 +643,7 @@ def run_pipeline():
                 residuals_log.append(
                     {
                         "repetition": repetition,
-                        "test_chunk": test_chunk,
+                        "test_chunks": ",".join(map(str, test_chunks)),
                         "model": model_name,
                         "setpoint": y_t,
                         "y_true": y_t,

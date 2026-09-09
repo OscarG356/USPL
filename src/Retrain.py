@@ -1,21 +1,47 @@
 """
 Experiment: Training models using the Top-80% most important features
+(Random Contiguous Chunk Split methodology)
 
-This script evaluates the impact of reducing the number of input features
-by training each model using only the subset of features that accounts for
-80% of the cumulative importance, based on previously computed SHAP and
-Permutation Importance rankings.
+This script replicates EXACTLY the data loading, contiguous-chunk
+construction, random TEST-chunk selection, leakage checks, TRAIN-only
+normalization, TSFEL feature extraction and model/CV setup of the main
+pipeline ("Random Contiguous Chunk Split"). It evaluates the impact of
+reducing the number of input features by training each model using only
+the subset of features that accounts for 80% of the cumulative importance,
+based on previously computed SHAP and Permutation Importance rankings from
+that main pipeline.
 
-The script requires:
-1. 'tabla_consenso_final.csv' (optional, only if it contains a 'model' column).
-2. 'ranking_consenso_perm.csv' and 'ranking_consenso_shap.csv' as the
+IMPORTANT: This version does NOT apply variance or correlation filtering.
+It uses ALL features from the Top-80% ranking that are present in the
+TSFEL-extracted common columns. This allows evaluation of the Top-80%
+feature set without additional feature reduction steps.
+
+The script requires, inside --original_run_dir:
+1. 'ranking_consenso_perm.csv' and 'ranking_consenso_shap.csv' as the
    default sources for model-specific feature importance rankings.
+2. 'tabla_consenso_final.csv' (optional, only used if it contains a
+   'model' column and a 'Consensus_General' column).
 3. 'metrics_per_iteration.csv' (optional). If available, it is used to
-   compare the Top-80% results with the original experiment using all
-   features. If it is not available, only the Top-80% results are generated.
+   compare the Top-80% results with the original ALL-FEATURES experiment.
+   If it is not available, only the Top-80% results are generated.
 
-The original SHAP and Permutation Importance analyses are not recalculated.
-The rankings are loaded from a previous run of the original pipeline.
+SHAP and Permutation Importance are NOT recalculated here; the rankings
+are loaded from a previous run of the main pipeline.
+
+The ONLY methodological difference versus the main pipeline is: after
+TSFEL feature extraction (and common column intersection between train
+and test), each model uses ALL features from its Top-80% ranking that
+are present in the common columns. No variance or correlation filtering
+is applied.
+
+NOTE ON WHAT WAS NOT PROVIDED: the exact `load_raw_signals` implementation
+of the main pipeline (column name used for the signal, i.e. `intensity`,
+target column names per regime, and the file-based `.CSV`/`.xlsx` loading
+logic) was given to me directly in this conversation as part of the main
+"Random Contiguous Chunk Split" pipeline script, and is reproduced here
+verbatim so both scripts stay perfectly comparable. I did not have to
+invent it. If your main pipeline's `load_raw_signals` has since changed,
+this function must be updated to match it again.
 """
 
 from __future__ import annotations
@@ -26,10 +52,6 @@ import os
 import re
 import sys
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -38,7 +60,7 @@ import tsfel
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import BayesianRidge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import GridSearchCV, GroupKFold, GroupShuffleSplit
+from sklearn.model_selection import GridSearchCV, GroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
@@ -62,12 +84,6 @@ parser.add_argument(
     help=("Feature domain to use: temporal, statistical, spectral, or all."),
 )
 parser.add_argument(
-    "--threshold_corr",
-    type=float,
-    default=0.90,
-    help=("Correlation threshold for feature elimination."),
-)
-parser.add_argument(
     "--top80_threshold",
     type=float,
     default=0.80,
@@ -77,7 +93,7 @@ parser.add_argument(
     "--original_run_dir",
     type=str,
     required=True,
-    help=("Path with the previus complete run."),
+    help=("Path with the previous complete run of the main pipeline."),
 )
 parser.add_argument(
     "--operation_regime",
@@ -104,9 +120,7 @@ RUN_DIR = os.path.join(
     args.feature_method,
     f"run_{TIMESTAMP}_top80",
 )
-PLOTS_DIR = os.path.join(RUN_DIR, "plots")
 os.makedirs(RUN_DIR, exist_ok=True)
-os.makedirs(PLOTS_DIR, exist_ok=True)
 
 MODEL_NAME_TO_FILESAFE = {
     "SVR": "SVR",
@@ -114,6 +128,10 @@ MODEL_NAME_TO_FILESAFE = {
     "Bayesian Ridge": "Bayesian_Ridge",
     "XGBoost": "XGBoost",
 }
+
+# Random Contiguous Chunk Split parameters (must match the main pipeline).
+N_CHUNKS = 10
+N_TEST_CHUNKS = 2
 
 print(f"--- Top-{args.top80_threshold:.0%} Feature Experiment: {USPL_ID} ---")
 print(f"--- Original Run Directory: {args.original_run_dir} ---")
@@ -131,9 +149,37 @@ def natural_sort_key(s: str) -> list:
     ]
 
 
-def load_raw_signals(data_folder: str):
-    """Carga y segmenta las señales CRUDAS. Sin normalizar.
-    Idéntico al pipeline original para garantizar splits comparables."""
+def create_contiguous_chunks(num_traces: int, n_chunks: int) -> np.ndarray:
+    """
+    Split `num_traces` traces (already in their original, physically-ordered
+    sequence) into `n_chunks` contiguous, approximately-equal-sized blocks.
+
+    Returns an array of length `num_traces` with the 1-indexed chunk id of
+    each trace. No shuffling is performed: trace i and trace i+1 are always
+    in the same chunk unless trace i is the last element of its block.
+
+    Identical to the main pipeline's `create_contiguous_chunks`.
+    """
+    chunk_assignment = np.zeros(num_traces, dtype=int)
+    for chunk_id, idx_block in enumerate(
+        np.array_split(np.arange(num_traces), n_chunks), start=1
+    ):
+        chunk_assignment[idx_block] = chunk_id
+    return chunk_assignment
+
+
+def load_raw_signals(data_folder: str, regime: str):
+    """
+    Load and cut RAW signals. Identical to the main "Random Contiguous
+    Chunk Split" pipeline, so that trace_id, chunk_id and target are
+    guaranteed to match exactly between the two scripts.
+
+    * chunk_id returned here is a placeholder built from
+      `create_contiguous_chunks` purely for structural consistency; the
+      actual TRAIN/TEST chunk assignment used by the pipeline is
+      recomputed once from `trace_id` in `run_pipeline`, before the
+      iteration loop (see there).
+    """
     signal_files = [
         f
         for f in os.listdir(data_folder)
@@ -145,28 +191,61 @@ def load_raw_signals(data_folder: str):
     for file_name in signal_files:
         file_path = os.path.join(data_folder, file_name)
         signal_df = pd.read_csv(file_path, header=0)
-        all_signals_data.append(signal_df.iloc[:, 1].astype(float))
+        all_signals_data.append(signal_df["intensity"].astype(float))
+        #all_signals_data.append(signal_df.iloc[:, 1].astype(float))
 
-    all_signals_data = all_signals_data[191:]
     signals_matrix = pd.DataFrame(all_signals_data).values
 
+    # Get fs
     example_df = pd.read_csv(os.path.join(data_folder, signal_files[0]), header=0)
     fs = 1 / (example_df.iloc[1, 0] - example_df.iloc[0, 0])
 
+    # Labels
     labels_df = pd.read_excel(os.path.join(data_folder, "Datos-Corriente.xlsx"))
-    t_Corriente_raw = labels_df["Corriente (mA)"].values[191:]
+    if regime == "mode-locking":
+        target_raw = labels_df["Corriente (mA)"].values[:]
+    else:
+        target_raw = labels_df["Ganancia-EDFA (dBm)"].values[:]
 
-    segmented_signals, segmented_labels = [], []
-    segment_length, num_segments = 300, 2
+    # Segmentation
+    num_traces = len(signals_matrix)
+
+    if regime == "mode-locking":
+        segment_length = 200
+        num_segments = 3
+    else:
+        segment_length = signals_matrix.shape[1]
+        num_segments = 1
+
+    # Placeholder contiguous chunk assignment (not used for the actual
+    # split, see docstring above).
+    chunk_assignment = create_contiguous_chunks(num_traces, N_CHUNKS)
+
+    segmented_signals = []
+    segmented_labels = []
+    segmented_chunks = []
+    segmented_trace_ids = []
+
     for idx, signal_array in enumerate(signals_matrix):
+        target_value = float(target_raw[idx])
+        chunk_id = int(chunk_assignment[idx])
+
         if len(signal_array) >= num_segments * segment_length:
             for i in range(num_segments):
                 segmented_signals.append(
                     signal_array[i * segment_length : (i + 1) * segment_length]
                 )
-                segmented_labels.append(t_Corriente_raw[idx])
+                segmented_labels.append(target_value)
+                segmented_chunks.append(chunk_id)
+                segmented_trace_ids.append(idx)
 
-    return np.array(segmented_signals), np.array(segmented_labels), fs
+    return (
+        np.array(segmented_signals),
+        np.array(segmented_labels),
+        np.array(segmented_chunks),
+        np.array(segmented_trace_ids),
+        fs,
+    )
 
 
 def mape(y_true, y_pred):
@@ -239,7 +318,6 @@ def build_top80_from_consensus_table(consenso_csv: str, threshold: float):
         )
         return None
 
-    # Detectar la columna de consenso a usar
     if "Consensus_General" not in df.columns:
         print(
             "[INFO] tabla_consenso_final.csv tiene columna 'model' pero no "
@@ -265,12 +343,8 @@ def build_top80_from_perm_shap(perm_csv: str, shap_csv: str, threshold: float):
             f"script). Buscados en:\n  {perm_csv}\n  {shap_csv}"
         )
 
-    df_p = pd.read_csv(
-        perm_csv
-    )  # feature, importance_mean, model, rank_perm, repetition
-    df_s = pd.read_csv(
-        shap_csv
-    )  # feature, shap_importance, model, rank_shap, repetition
+    df_p = pd.read_csv(perm_csv)  # feature, importance_mean, model, rank_perm, ...
+    df_s = pd.read_csv(shap_csv)  # feature, shap_importance, model, rank_shap, ...
 
     required_p = {"feature", "importance_mean", "model"}
     required_s = {"feature", "shap_importance", "model"}
@@ -392,7 +466,9 @@ def run_pipeline():
         df_top[df_top["model"] == m].to_csv(os.path.join(RUN_DIR, fname), index=False)
 
     # --- 5.2 Cargar datos crudos (idéntico al pipeline original) ---
-    X_raw, y_raw, fs = load_raw_signals(RAW_DIR)
+    X_raw, y_raw, _chunk_raw_dummy, trace_id_raw, fs = load_raw_signals(
+        RAW_DIR, args.operation_regime
+    )
     domain = args.feature_method
     if domain == "all":
         domain = None
@@ -400,34 +476,91 @@ def run_pipeline():
 
     metrics_log, residuals_log, split_log = [], [], []
     iter_pred_records = []
+    N_ITERS = args.iters
 
-    for iteration in range(args.iters):
+    # --------------------------------------------------------------
+    # Contiguous chunk assignment (Random Contiguous Chunk Split)
+    # --------------------------------------------------------------
+    # Computed once, before the iteration loop: the chunk boundaries never
+    # change across iterations, only the random selection of which 2 chunks
+    # act as TEST changes per iteration (identical to the main pipeline).
+    unique_traces = np.unique(trace_id_raw)
+    num_traces = len(unique_traces)
+
+    chunks_array = create_contiguous_chunks(num_traces, N_CHUNKS)
+    trace_to_chunk = dict(zip(unique_traces, chunks_array))
+    chunk_raw = np.array([trace_to_chunk[t_id] for t_id in trace_id_raw])
+
+    # Sanity check: every chunk must be made of index-contiguous traces.
+    for chunk_id in range(1, N_CHUNKS + 1):
+        traces_in_chunk = np.sort(unique_traces[chunks_array == chunk_id])
+        if len(traces_in_chunk) > 1:
+            assert np.all(np.diff(traces_in_chunk) == 1), (
+                f"FATAL ERROR: Chunk {chunk_id} is not made of contiguous traces."
+            )
+
+    for iteration in range(N_ITERS):
         repetition = iteration + 1
-        print(f"\n{'=' * 50}\nIteration {repetition}/{args.iters}\n{'=' * 50}")
 
-        # --- SPLIT LEAKAGE-SAFE (misma semilla que el pipeline original) ---
-        splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=iteration)
-        train_idx, test_idx = next(splitter.split(X_raw, y_raw, groups=y_raw))
-        X_train_raw, X_test_raw = X_raw[train_idx], X_raw[test_idx]
-        y_train, y_test = y_raw[train_idx], y_raw[test_idx]
+        # --- Random selection of TEST chunks (only source of randomness) ---
+        rng = np.random.default_rng(42 + repetition)
+        test_chunks = sorted(
+            rng.choice(
+                np.arange(1, N_CHUNKS + 1), size=N_TEST_CHUNKS, replace=False
+            ).tolist()
+        )
+        train_chunks = [c for c in range(1, N_CHUNKS + 1) if c not in test_chunks]
 
-        train_groups = np.unique(y_train)
-        test_groups = np.unique(y_test)
-        assert len(set(train_groups) & set(test_groups)) == 0, (
-            "ERROR FATAL: Leakage en Split (setpoints de corriente "
-            "compartidos entre train y test)"
+        # --- Train/Test Split ---
+        train_mask = np.isin(chunk_raw, train_chunks)
+        test_mask = np.isin(chunk_raw, test_chunks)
+
+        X_train_raw, X_test_raw = X_raw[train_mask], X_raw[test_mask]
+        y_train, y_test = y_raw[train_mask], y_raw[test_mask]
+        chunk_train, chunk_test = chunk_raw[train_mask], chunk_raw[test_mask]
+        trace_id_train, trace_id_test = (
+            trace_id_raw[train_mask],
+            trace_id_raw[test_mask],
+        )
+
+        test_min, test_max = float(y_test.min()), float(y_test.max())
+
+        print(f"\n{'=' * 50}")
+        print(f"Iteration {repetition}/{N_ITERS}")
+        print(f"TEST CHUNKS: {test_chunks}")
+        print(f"TEST RANGE: {test_min:.2f}–{test_max:.2f} mA")
+        print(f"TRAIN CHUNKS: {train_chunks}")
+        print(f"{'=' * 50}")
+
+        # --- Leakage Checks (idénticos al pipeline original) ---
+        assert len(set(train_chunks) & set(test_chunks)) == 0, (
+            "FATAL ERROR: Chunk leakage detected between TRAIN and TEST."
+        )
+        assert set(np.unique(chunk_train)) == set(train_chunks), (
+            "FATAL ERROR: TRAIN does not contain exactly the expected chunks."
+        )
+        assert set(np.unique(chunk_test)) == set(test_chunks), (
+            "FATAL ERROR: TEST does not correspond exactly to the expected chunks."
+        )
+        assert len(set(trace_id_train) & set(trace_id_test)) == 0, (
+            "FATAL ERROR: Trace leakage detected between TRAIN and TEST."
         )
 
         split_log.append(
             {
                 "repetition": repetition,
-                "random_seed": iteration,
-                "train_groups": train_groups.tolist(),
-                "test_groups": test_groups.tolist(),
+                "test_chunks": ",".join(map(str, test_chunks)),
+                "train_chunks": ",".join(map(str, train_chunks)),
+                "test_current_min": test_min,
+                "test_current_max": test_max,
+                "train_current_min": float(y_train.min()),
+                "train_current_max": float(y_train.max()),
+                "n_train_samples": len(y_train),
+                "n_test_samples": len(y_test),
             }
         )
 
-        # --- NORMALIZACIÓN (solo con TRAIN) ---
+        # --- Train-Based Signal Normalization ---
         X_min_train = np.min(X_train_raw)
         X_max_train = np.max(X_train_raw)
         X_train_norm = (
@@ -459,43 +592,47 @@ def run_pipeline():
         X_train_feat, X_test_feat = X_train_feat[common_cols], X_test_feat[common_cols]
         print(f"Features extraídas (TSFEL, comunes train/test): {len(common_cols)}")
 
-        # --- VALIDACIÓN: las features Top-N% deben existir tras TSFEL ---
         iter_preds = {"repetition": repetition, "Actual_Current": y_test}
 
         for model_name, (estimator, param_grid) in models.items():
-            model_features = top_features_per_model[model_name]
-            missing_feats = [f for f in model_features if f not in common_cols]
-            if missing_feats:
+            top_feats_for_model = top_features_per_model[model_name]
+
+            # A Top-80% feature that does not even exist after TSFEL /
+            # common_cols is a data/config incompatibility, not a normal
+            # variance/correlation exclusion: fail loudly and clearly.
+            missing_from_tsfel = [
+                f for f in top_feats_for_model if f not in common_cols
+            ]
+            if missing_from_tsfel:
                 raise ValueError(
                     f"[ERROR] Iteración {repetition} / Modelo '{model_name}': "
                     f"las siguientes features Top-{args.top80_threshold:.0%} "
-                    f"seleccionadas por el ranking de interpretabilidad NO "
-                    f"existen entre las features extraídas por TSFEL en esta "
-                    f"corrida: {missing_feats}. Verifica que "
-                    f"--feature_method coincida con el usado en la corrida "
-                    f"original y que los datos crudos sean los mismos. Se "
-                    f"detiene la ejecución en lugar de eliminarlas "
-                    f"silenciosamente."
+                    f"del ranking de interpretabilidad NO existen entre las "
+                    f"features extraídas por TSFEL en esta corrida (tras la "
+                    f"intersección train/test): {missing_from_tsfel}. Esto "
+                    f"sugiere una incompatibilidad entre --feature_method / "
+                    f"--operation_regime / datos crudos usados aquí y los "
+                    f"usados para generar --original_run_dir. Se detiene la "
+                    f"ejecución en lugar de eliminarlas silenciosamente."
                 )
 
-            X_train_sel_df = X_train_feat[model_features]
-            X_test_sel_df = X_test_feat[model_features]
+            # Usar TODAS las features Top-80% que existen en common_cols.
+            # No se aplica filtro de varianza ni de correlación.
+            final_features = [f for f in top_feats_for_model if f in common_cols]
+            if not final_features:
+                raise ValueError(
+                    f"[ERROR] Iteración {repetition} / Modelo '{model_name}': "
+                    f"no se encontraron features del Top-"
+                    f"{args.top80_threshold:.0%} en los datos TSFEL comunes. "
+                    f"No hay features disponibles para entrenar."
+                )
 
-            # Verificación de columnas idénticas train/test
-            assert list(X_train_sel_df.columns) == list(X_test_sel_df.columns), (
-                f"[ERROR] Columnas de train/test no coinciden para "
-                f"'{model_name}' en la iteración {repetition}."
-            )
+            X_train_sel = X_train_feat[final_features].values
+            X_test_sel = X_test_feat[final_features].values
 
-            # Imputación segura (ajustada SOLO con TRAIN) por si TSFEL
-            # produce NaN puntuales en alguna fila/feature.
-            train_means = X_train_sel_df.mean()
-            X_train_sel = X_train_sel_df.fillna(train_means).values
-            X_test_sel = X_test_sel_df.fillna(train_means).values
-
-            # --- ENTRENAMIENTO ---
+            # --- ENTRENAMIENTO (idéntico al pipeline original) ---
             pipe = Pipeline([("scaler", StandardScaler()), ("model", estimator)])
-            inner_cv = GroupKFold(n_splits=5)
+            inner_cv = GroupKFold(n_splits=4)
             grid = GridSearchCV(
                 pipe,
                 param_grid,
@@ -503,7 +640,7 @@ def run_pipeline():
                 scoring="neg_mean_absolute_error",
                 n_jobs=-1,
             )
-            grid.fit(X_train_sel, y_train, groups=y_train)
+            grid.fit(X_train_sel, y_train, groups=chunk_train)
             y_pred = grid.predict(X_test_sel)
             iter_preds[f"Pred_{model_name}"] = y_pred
 
@@ -511,13 +648,16 @@ def run_pipeline():
                 {
                     "repetition": repetition,
                     "model": model_name,
-                    "feature_set": "Top80",
+                    "test_chunks": ",".join(map(str, test_chunks)),
+                    "train_chunks": ",".join(map(str, train_chunks)),
+                    "test_current_min": test_min,
+                    "test_current_max": test_max,
                     "R2": r2_score(y_test, y_pred),
                     "MAE": mean_absolute_error(y_test, y_pred),
                     "RMSE": np.sqrt(mean_squared_error(y_test, y_pred)),
                     "MAPE": mape(y_test, y_pred),
-                    "n_features": len(model_features),
-                    "features_used": ";".join(model_features),
+                    "n_features": len(final_features),
+                    "features_used": ";".join(final_features),
                     "best_params": str(grid.best_params_),
                 }
             )
@@ -529,8 +669,8 @@ def run_pipeline():
                 residuals_log.append(
                     {
                         "repetition": repetition,
+                        "test_chunks": ",".join(map(str, test_chunks)),
                         "model": model_name,
-                        "feature_set": "Top80",
                         "setpoint": y_t,
                         "y_true": y_t,
                         "y_pred": y_p,
@@ -561,9 +701,9 @@ def run_pipeline():
     df_preds = pd.DataFrame(iter_pred_records)
     save_to_run_append(df_preds, "model_predictions_history_top80.csv")
 
-    # --- Resumen y CI 95% (bootstrap, igual metodología que el original) ---
+    # --- Resumen y CI 95% (bootstrap, idéntico al pipeline original: sin
+    # semilla global fija, n_boot=1000) ---
     summary_list = []
-    np.random.seed(42)
     n_boot = 1000
     for model in df_metrics["model"].unique():
         for metric in ["R2", "MAE", "RMSE", "MAPE"]:
@@ -586,6 +726,7 @@ def run_pipeline():
                     "Median": median_val,
                     "CI95_lower": ci_lower,
                     "CI95_upper": ci_upper,
+                    "n_iterations": len(data),
                 }
             )
     df_summary = pd.DataFrame(summary_list)
@@ -623,8 +764,6 @@ def run_pipeline():
     comparison_rows = []
     all_available = os.path.exists(all_metrics_path)
 
-    # Estadísticos Top80 en formato ancho (para armar tabla comparativa y
-    # el archivo de impacto de reducción de features)
     def agg_stats(df, model, metric):
         vals = df[df["model"] == model][metric].values
         return np.mean(vals), np.std(vals)
@@ -748,12 +887,7 @@ def run_pipeline():
     df_impact.to_csv(os.path.join(RUN_DIR, "feature_impact_analysis.csv"), index=False)
 
     # --------------------------------------------------------------
-    # 8. GRÁFICAS
-    # --------------------------------------------------------------
-    generate_plots(df_metrics, df_residuals, df_comparison, all_available, model_names)
-
-    # --------------------------------------------------------------
-    # 9. RESUMEN FINAL POR CONSOLA
+    # 8. RESUMEN FINAL POR CONSOLA
     # --------------------------------------------------------------
     print_final_summary(df_metrics, model_names)
 
@@ -762,125 +896,7 @@ def run_pipeline():
 
 
 # --------------------------------------------------------------
-# 10. GRÁFICAS
-# --------------------------------------------------------------
-
-
-def generate_plots(df_metrics, df_residuals, df_comparison, all_available, model_names):
-    # A. Number of features comparison (All vs Top80)
-    if all_available:
-        pivot_n = df_comparison.pivot(
-            index="Model", columns="Feature_Set", values="N_Features"
-        )
-        pivot_n = pivot_n.reindex(model_names)
-        fig, ax = plt.subplots(figsize=(8, 5))
-        pivot_n.plot(kind="bar", ax=ax)
-        ax.set_ylabel("Number of features")
-        ax.set_title(f"Number of features: All vs Top-{args.top80_threshold:.0%}")
-        plt.tight_layout()
-        fig.savefig(os.path.join(PLOTS_DIR, "A_n_features_all_vs_top80.png"), dpi=150)
-        plt.close(fig)
-    else:
-        n_top80 = df_metrics.groupby("model")["n_features"].first().reindex(model_names)
-        fig, ax = plt.subplots(figsize=(8, 5))
-        n_top80.plot(kind="bar", ax=ax, color="steelblue")
-        ax.set_ylabel("Number of features")
-        ax.set_title(f"Number of Top-{args.top80_threshold:.0%} features per model")
-        plt.tight_layout()
-        fig.savefig(os.path.join(PLOTS_DIR, "A_n_features_top80.png"), dpi=150)
-        plt.close(fig)
-
-    # B. Performance comparison (R2, MAE, RMSE): All vs Top80
-    if all_available:
-        for metric in ["R2", "MAE", "RMSE"]:
-            pivot_m = df_comparison.pivot(
-                index="Model", columns="Feature_Set", values=f"{metric}_Mean"
-            ).reindex(model_names)
-            pivot_std = df_comparison.pivot(
-                index="Model", columns="Feature_Set", values=f"{metric}_Std"
-            ).reindex(model_names)
-            fig, ax = plt.subplots(figsize=(8, 5))
-            pivot_m.plot(kind="bar", yerr=pivot_std, ax=ax, capsize=4)
-            ax.set_ylabel(metric)
-            ax.set_title(f"{metric}: All vs Top-{args.top80_threshold:.0%}")
-            plt.tight_layout()
-            fig.savefig(
-                os.path.join(PLOTS_DIR, f"B_{metric}_all_vs_top80.png"), dpi=150
-            )
-            plt.close(fig)
-    else:
-        for metric in ["R2", "MAE", "RMSE"]:
-            means = df_metrics.groupby("model")[metric].mean().reindex(model_names)
-            stds = df_metrics.groupby("model")[metric].std().reindex(model_names)
-            fig, ax = plt.subplots(figsize=(8, 5))
-            ax.bar(
-                means.index,
-                means.values,
-                yerr=stds.values,
-                capsize=4,
-                color="darkorange",
-            )
-            ax.set_ylabel(metric)
-            ax.set_title(f"{metric} (Top-{args.top80_threshold:.0%}) per model")
-            plt.xticks(rotation=20)
-            plt.tight_layout()
-            fig.savefig(os.path.join(PLOTS_DIR, f"B_{metric}_top80.png"), dpi=150)
-            plt.close(fig)
-
-    # C. Predicted vs actual value (Top80), per model
-    for model in model_names:
-        sub = df_residuals[df_residuals["model"] == model]
-        if sub.empty:
-            continue
-        fig, ax = plt.subplots(figsize=(6, 6))
-        ax.scatter(sub["y_true"], sub["y_pred"], alpha=0.4, s=15)
-        lims = [
-            min(sub["y_true"].min(), sub["y_pred"].min()),
-            max(sub["y_true"].max(), sub["y_pred"].max()),
-        ]
-        ax.plot(lims, lims, "r--", linewidth=1)
-        ax.set_xlabel("Actual current (mA)")
-        ax.set_ylabel("Predicted current (mA)")
-        safe_name = MODEL_NAME_TO_FILESAFE[model]
-        ax.set_title(f"{model} — Predicted vs Actual (Top-{args.top80_threshold:.0%})")
-        plt.tight_layout()
-        fig.savefig(os.path.join(PLOTS_DIR, f"C_pred_vs_real_{safe_name}.png"), dpi=150)
-        plt.close(fig)
-
-    # D. Error by current (setpoint)
-    for model in model_names:
-        sub = df_residuals[df_residuals["model"] == model]
-        if sub.empty:
-            continue
-        grouped = (
-            sub.groupby("setpoint")
-            .agg(
-                MAE=("absolute_error", "mean"),
-                RMSE=("residual", lambda x: np.sqrt(np.mean(x**2))),
-            )
-            .reset_index()
-        )
-        fig, ax = plt.subplots(figsize=(8, 5))
-        ax.plot(grouped["setpoint"], grouped["MAE"], marker="o", label="MAE")
-        ax.plot(grouped["setpoint"], grouped["RMSE"], marker="s", label="RMSE")
-        ax.set_xlabel("Current setpoint (mA)")
-        ax.set_ylabel("Error")
-        safe_name = MODEL_NAME_TO_FILESAFE[model]
-        ax.set_title(
-            f"{model} — Error by current setpoint (Top-{args.top80_threshold:.0%})"
-        )
-        ax.legend()
-        plt.tight_layout()
-        fig.savefig(
-            os.path.join(PLOTS_DIR, f"D_error_por_corriente_{safe_name}.png"), dpi=150
-        )
-        plt.close(fig)
-
-    print(f"[OK] Plots saved to: {PLOTS_DIR}")
-
-
-# --------------------------------------------------------------
-# 11. RESUMEN FINAL POR CONSOLA
+# 9. RESUMEN FINAL POR CONSOLA
 # --------------------------------------------------------------
 
 
